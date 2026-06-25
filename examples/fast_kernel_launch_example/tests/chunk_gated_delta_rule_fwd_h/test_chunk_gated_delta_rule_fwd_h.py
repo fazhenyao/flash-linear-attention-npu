@@ -169,6 +169,68 @@ def test_interface_exist():
         "operator chunk_gated_delta_rule_fwd_h is not registered under torch.ops.ascend_ops"
 
 
+# Shapes aligned with fla/.../tests/pta/run_gdn_fwd_h.sh defaults.
+PTA_FIX_CONFIG = (
+    1, 256, 2, 2, 128, 128, 64, torch.bfloat16, torch.float32,
+)
+
+
+def make_inputs(
+    batch,
+    seqlen,
+    k_num_head,
+    v_num_head,
+    k_head_dim,
+    v_head_dim,
+    chunk_size,
+    dtype,
+    g_dtype,
+    use_initial_state=False,
+):
+    random.seed(1)
+    torch.manual_seed(1)
+    k = torch.randn(batch, k_num_head, seqlen, k_head_dim, dtype=dtype)
+    w = torch.randn(batch, v_num_head, seqlen, k_head_dim, dtype=dtype)
+    u = torch.randn(batch, v_num_head, seqlen, v_head_dim, dtype=dtype)
+    g = gen_decay_data(batch, v_num_head, seqlen, chunk_size, 1, None).to(g_dtype)
+    initial_state = None
+    if use_initial_state:
+        initial_state = torch.randn(batch, v_num_head, k_head_dim, v_head_dim, dtype=torch.float32)
+    return k, w, u, g, initial_state
+
+
+@pytest.mark.skipif(not torch.npu.is_available(), reason="NPU device not found")
+@pytest.mark.parametrize(
+    "batch,seqlen,k_num_head,v_num_head,k_head_dim,v_head_dim,chunk_size,dtype,g_dtype",
+    [PTA_FIX_CONFIG],
+    ids=["pta_fix_bf16"],
+)
+def test_chunk_gated_delta_rule_fwd_h_pta_shape(
+    batch, seqlen, k_num_head, v_num_head, k_head_dim, v_head_dim, chunk_size, dtype, g_dtype
+):
+    k, w, u, g, initial_state = make_inputs(
+        batch, seqlen, k_num_head, v_num_head, k_head_dim, v_head_dim, chunk_size, dtype, g_dtype
+    )
+    output_final_state = False
+
+    h_ref, v_ref, _ = forward_h_trans_cpu(
+        k, w, u, g, initial_state, output_final_state, chunk_size, cu_seqlens=None
+    )
+    h, v_new, final_state = torch.ops.ascend_ops.chunk_gated_delta_rule_fwd_h(
+        k.npu(), w.npu(), u.npu(), g.npu(),
+        initial_state=initial_state.npu() if initial_state is not None else None,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        cu_seqlens=None,
+        chunk_indices=None,
+    )
+
+    diff_thd = 1e-2 if dtype == torch.bfloat16 else 4e-3
+    assert_close(h, h_ref, diff_thd, name="h")
+    assert_close(v_new, v_ref, diff_thd, name="v_new")
+    assert final_state is None
+
+
 # --------------------------------------------------------------------------------------
 # model-distributed fixtures (produced by dump_model_data.py)
 #
