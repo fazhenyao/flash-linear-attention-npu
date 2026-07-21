@@ -224,7 +224,7 @@ def npu_chunk_gated_delta_rule_bwd_dhu(
     Hv, V = dv_shape[1], dv_shape[3]
     NT = _chunk_num(T, int(chunk_size), chunk_indices)
     dh = _empty((B, Hv, NT, K, V), q)
-    dh0 = _empty((B, Hv, NT, K, V), q) if h0 is not None else None
+    dh0 = _empty((B, Hv, K, V), q) if h0 is not None else None
     dv2 = _empty_like(dv)
     outputs = (dh, dh0, dv2)
     return _call_aclnn(
