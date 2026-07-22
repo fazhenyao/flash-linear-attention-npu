@@ -60,7 +60,7 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdDhu(
 | `w` | 输入 | 必选 | Weight（衰减权重）输入张量 | 参与隐藏状态更新 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, K]` | 支持 |
 | `dO` | 输入 | 必选 | 前向输出 `o` 的梯度张量 | 即上游输出梯度 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, V]` | 支持 |
 | `dv` | 输入 | 必选 | Value 的上游梯度张量 | 将与来自 `dh` 的贡献叠加后输出为 `dv2` | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, V]` | 支持 |
-| `gOptional` | 输入 | 必选 | 标量 Gate 张量 | 对隐藏状态递推施加自然指数门控 `exp(g)` | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, HV, T]` | 支持 |
+| `gOptional` | 输入 | 必选 | 标量 Gate 张量 | 对隐藏状态递推施加 base-2 门控 `exp2(g)` | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, HV, T]` | 支持 |
 | `gkOptional` | 输入 | 可选 | Key-wise Gate 张量 | 对每个 Key 维度施加 base-2 门控 `exp2(gk)` | `FLOAT16`、`BFLOAT16`、`FLOAT`（与 `g` 同 dtype） | `ND` | `[B, HV, T, K]` | 支持 |
 | `h0Optional` | 输入 | 可选 | 初始隐藏状态张量 | 提供时声明需要输出 `dh0`；其数值不参与本算子的反向递推 | `FLOAT16`、`BFLOAT16` | `ND` | `[N, HV, K, V]` | 支持 |
 | `dhtOptional` | 输入 | 可选 | 末尾隐藏状态的梯度张量 | 反向递推的起始梯度 | `FLOAT` | `ND` | `[B, HV, K, V]` | 支持 |
@@ -163,7 +163,7 @@ B = 1
 # dv2：叠加来自隐藏状态的 Value 梯度
 b_dv  = k_chunk @ b_dh                        # 从当前 dh 产生的 dv 贡献
 if g:
-    b_dv *= exp(g_last - g_chunk)[:, None]     # 门控衰减
+    b_dv *= exp2(g_last - g_chunk)[:, None]    # 门控衰减
 dv2_chunk = b_dv + dv_chunk                   # 与上游 dv 叠加
 
 # dh 存储（在更新前记录当前 chunk 的 dh）
@@ -171,8 +171,8 @@ dh[:, :, i_t] = b_dh
 
 # 反向递推更新 b_dh（传递给上一 chunk）
 if g:
-    b_dh *= exp(g_last)
-term1 = (q_chunk * exp(g_chunk))^T @ dO_chunk * scale
+    b_dh *= exp2(g_last)
+term1 = (q_chunk * exp2(g_chunk))^T @ dO_chunk * scale
 term2 = w_chunk^T @ dv2_chunk
 b_dh = b_dh + term1 - term2
 ```
