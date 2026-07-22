@@ -66,11 +66,19 @@ struct ChunkGatedDeltaRuleBwdDhuTilingContext {
     const gert::StorageShape *doShape;
     const gert::StorageShape *dvShape;
     const gert::StorageShape *gShape;
+    const gert::StorageShape *gkShape;
+    const gert::StorageShape *h0Shape;
+    const gert::StorageShape *dhtShape;
     const gert::StorageShape *cuSeqlensShape;
     const gert::StorageShape *chunkIndicesShape;
     ge::DataType qDtype;
     ge::DataType gDtype;
+    ge::DataType gkDtype;
+    ge::DataType dhtDtype;
     bool hasG;
+    bool hasGk;
+    bool hasH0;
+    bool hasDht;
     bool hasScaleAttr;
     double scaleAttr;
     int32_t chunkSize;
@@ -196,6 +204,9 @@ public:
         tiling_.T = T_;
         tiling_.K = K_;
         tiling_.V = V_;
+        tiling_.hasGk = ctx_.hasGk ? 1 : 0;
+        tiling_.hasH0 = ctx_.hasH0 ? 1 : 0;
+        tiling_.hasDht = ctx_.hasDht ? 1 : 0;
         tiling_.isScale = isScale ? 1 : 0;
         tiling_.scale = scale;
         tiling_.chunkSize = chunkSize_;
@@ -235,6 +246,31 @@ public:
         OP_CHECK_IF(isVariableLen_ && B_ != 1,
                     OP_LOGE(ctx_.nodeName, "B must be 1 when sequence is variable len, but got %lu.", B_),
                     return ge::GRAPH_FAILED);
+        const uint64_t stateBatch = isVariableLen_ ? tiling_.seqNum : B_;
+        if (ctx_.hasGk) {
+            const gert::Shape gkShape = ctx_.gkShape->GetStorageShape();
+            OP_CHECK_IF(gkShape.GetDim(0) != static_cast<int64_t>(B_) ||
+                            gkShape.GetDim(1) != static_cast<int64_t>(Hv_) ||
+                            gkShape.GetDim(2) != static_cast<int64_t>(T_) ||
+                            gkShape.GetDim(3) != static_cast<int64_t>(K_),
+                        OP_LOGE(ctx_.nodeName, "gk must be [B,Hv,T,K]."), return ge::GRAPH_FAILED);
+        }
+        if (ctx_.hasH0) {
+            const gert::Shape h0Shape = ctx_.h0Shape->GetStorageShape();
+            OP_CHECK_IF(h0Shape.GetDim(0) != static_cast<int64_t>(stateBatch) ||
+                            h0Shape.GetDim(1) != static_cast<int64_t>(Hv_) ||
+                            h0Shape.GetDim(2) != static_cast<int64_t>(K_) ||
+                            h0Shape.GetDim(3) != static_cast<int64_t>(V_),
+                        OP_LOGE(ctx_.nodeName, "h0 must be [N,Hv,K,V]."), return ge::GRAPH_FAILED);
+        }
+        if (ctx_.hasDht) {
+            const gert::Shape dhtShape = ctx_.dhtShape->GetStorageShape();
+            OP_CHECK_IF(dhtShape.GetDim(0) != static_cast<int64_t>(stateBatch) ||
+                            dhtShape.GetDim(1) != static_cast<int64_t>(Hv_) ||
+                            dhtShape.GetDim(2) != static_cast<int64_t>(K_) ||
+                            dhtShape.GetDim(3) != static_cast<int64_t>(V_),
+                        OP_LOGE(ctx_.nodeName, "dht must be [N,Hv,K,V]."), return ge::GRAPH_FAILED);
+        }
         return ge::GRAPH_SUCCESS;
     }
 
@@ -254,6 +290,14 @@ public:
             tilingKey_ = GDN::CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY_G_FP32;
         } else {
             tilingKey_ = GDN::CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY;
+        }
+        if (ctx_.hasGk && ctx_.gkDtype != gDtype) {
+            OP_LOGE(ctx_.nodeName, "gk must have the same dtype as g.");
+            return ge::GRAPH_FAILED;
+        }
+        if (ctx_.hasDht && ctx_.dhtDtype != ge::DT_FLOAT) {
+            OP_LOGE(ctx_.nodeName, "dht must be float32.");
+            return ge::GRAPH_FAILED;
         }
         return ge::GRAPH_SUCCESS;
     }

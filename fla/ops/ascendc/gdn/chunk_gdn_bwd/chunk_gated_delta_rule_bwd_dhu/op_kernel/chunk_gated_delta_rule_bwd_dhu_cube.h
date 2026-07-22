@@ -169,6 +169,8 @@ public:
         uint64_t seqNum = 0;
         uint64_t usedCoreNum = 0;
         bool isVarLen = false;
+        bool hasDht = false;
+        bool hasH0 = false;
         uint64_t bdvWorkspaceOffset = 0;
         uint64_t gQWorkspaceOffset = 0;
         uint64_t bdhTerm1WorkspaceOffset = 0;
@@ -184,6 +186,7 @@ public:
                GM_ADDR w_ , LayoutW layoutW_, GM_ADDR dv2_ , LayoutDv2 layoutDv2_, LayoutBdh layoutBdh_,
                GM_ADDR cu_seqlens_, uint64_t B_, uint64_t T_, uint64_t Hv_, uint64_t Hk_, uint64_t K_, uint64_t V_,
                uint64_t BT_, uint64_t chunkNum_, uint64_t seqNum_, uint64_t usedCoreNum_, bool isVarLen_,
+               bool hasDht_, bool hasH0_,
                uint64_t bdvWorkspaceOffset_, uint64_t gQWorkspaceOffset_,uint64_t bdhTerm1WorkspaceOffset_, uint64_t bdhTerm2WorkspaceOffset_): 
             k(k_), 
             layoutK(layoutK_),
@@ -211,6 +214,8 @@ public:
             seqNum(seqNum_),
             usedCoreNum(usedCoreNum_),
             isVarLen(isVarLen_),
+            hasDht(hasDht_),
+            hasH0(hasH0_),
             bdvWorkspaceOffset(bdvWorkspaceOffset_),
             gQWorkspaceOffset(gQWorkspaceOffset_),
             bdhTerm1WorkspaceOffset(bdhTerm1WorkspaceOffset_),
@@ -276,11 +281,11 @@ public:
                     uint32_t curBT = 0;
                     for (int32_t chunkIdx = curChunkNum - 1; chunkIdx >= 0; chunkIdx --) {
                     // cacl k @ dh
-                    if (chunkIdx == curChunkNum -1) {
+                    if (chunkIdx == curChunkNum -1 && !params.hasDht) {
                         curBT = curSeqLen - chunkIdx * params.BT;
                         // skip k_i @ dh_0
                     } else {
-                        curBT = params.BT;  // BT = 64/128 is always 16 aligned
+                        curBT = chunkIdx == curChunkNum - 1 ? curSeqLen - chunkIdx * params.BT : params.BT;
                         // init GlobalTensor
                         gmK.SetGlobalBuffer((__gm__ ElementK *)params.k + gmOffsetQK + chunkIdx * params.BT * params.K);
                          // 用的是上一次chunk迭代的结果
@@ -354,7 +359,7 @@ public:
                     } // end chunk k @ dh
                     
 
-                    if (chunkIdx != 0)
+                    if (chunkIdx != 0 || params.hasH0)
                     {
                         gmGq.SetGlobalBuffer((__gm__ ElementGq *)params.workspace + params.gQWorkspaceOffset + coreIdx * params.BT * params.K);
                         gmDo.SetGlobalBuffer((__gm__ ElementDo *)params.dO + gmOffsetV + chunkIdx * params.BT * params.V);
@@ -727,6 +732,7 @@ __aicore__ inline void GDRCube<DT, GT>::Process()
                                      w, layoutW, dv2, layoutDv2, layoutBdh, // w^T @ dv2 -> bdh[workspace] 
                                      cu_seqlens, this->B, this->T, this->Hv, this->Hk, this->K, this->V, 
                                      this->chunkSize, this->chunkNum, this->seqNum, this->usedCoreNum, static_cast<bool>(this->isVarLen),
+                                     static_cast<bool>(this->hasDht), static_cast<bool>(this->hasH0),
                                      bdvWorkspaceOffset, gQWorkspaceOffset, bdhTerm1WorkspaceOffset, bdhTerm2WorkspaceOffset};
     kernel(param);
     return;
