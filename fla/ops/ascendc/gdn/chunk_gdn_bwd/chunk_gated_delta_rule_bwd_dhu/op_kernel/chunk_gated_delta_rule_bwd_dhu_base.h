@@ -96,6 +96,7 @@ protected:
     LocalTensor<float> wv2CastLocal;
     LocalTensor<DT> qdoLocal; // [K/2,V]
     LocalTensor<float> qdoCastLocal;
+    LocalTensor<GT> gkLocal;
     
     // tiling data
     uint64_t B = 0;

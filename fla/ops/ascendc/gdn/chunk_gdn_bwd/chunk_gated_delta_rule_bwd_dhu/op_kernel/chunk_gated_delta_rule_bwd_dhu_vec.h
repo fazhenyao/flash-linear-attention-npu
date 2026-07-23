@@ -113,19 +113,17 @@ __aicore__ inline void GDRVec<DT, GT>::InitUB()
     dv2Offset += this->dvBufSize * FLOAT_DTYPE_SIZE;
     this->bdvCastLocal = this->vecTbuf.template GetWithOffset<float>(this->dvBufSize, dv2Offset); // 64k
     // calc bdh = bdh + qdo*scale - wv2
-    // | bdhCastLocal/wV2CastLocal 64 | qDoCastLocal 64 |
-    // | 32 | bdhLocal/wV2Local       | 32 | qDoLocal   |
+    // | bdhCastLocal/wv2CastLocal | qdoCastLocal | shared half input/output |
     uint64_t offsetDh = 0;
-    uint32_t halfDhBufByte = this->dhBufSize * HALF_DTYPE_SIZE;
-    this->bdhCastLocal = this->vecTbuf.template Get<float>(this->dhBufSize); 
-    this->bdhLocal = this->vecTbuf.template GetWithOffset<DT>(this->dhBufSize, halfDhBufByte);
-    // 复用
+    this->bdhCastLocal = this->vecTbuf.template Get<float>(this->dhBufSize);
     this->wv2CastLocal = this->vecTbuf.template GetWithOffset<float>(this->dhBufSize, offsetDh);
-    this->wv2Local = this->vecTbuf.template GetWithOffset<DT>(this->dhBufSize, offsetDh + halfDhBufByte);
     offsetDh += this->dhBufSize * FLOAT_DTYPE_SIZE;
     this->qdoCastLocal = this->vecTbuf.template GetWithOffset<float>(this->dhBufSize, offsetDh);
-    this->qdoLocal = this->vecTbuf.template GetWithOffset<DT>(this->dhBufSize, offsetDh + halfDhBufByte);
     offsetDh += this->dhBufSize * FLOAT_DTYPE_SIZE;
+    this->bdhLocal = this->vecTbuf.template GetWithOffset<DT>(this->dhBufSize, offsetDh);
+    this->wv2Local = this->vecTbuf.template GetWithOffset<DT>(this->dhBufSize, offsetDh);
+    this->qdoLocal = this->vecTbuf.template GetWithOffset<DT>(this->dhBufSize, offsetDh);
+    this->gkLocal = this->vecTbuf.template GetWithOffset<GT>(this->halfK, offsetDh);
 }
 
 template <typename DT, typename GT>
@@ -311,8 +309,13 @@ __aicore__ inline void GDRVec<DT, GT>::InitLastDh()
 {
     uint64_t lastDhOffset = gmOffsetH_ + static_cast<uint64_t>(curChunkNum_ - 1) * dhBlockSize_;
     if (this->hasDht) {
-        CopyIn(this->bdhCastLocal, this->bdhCastLocal, this->dhtGm[gmOffsetState_], this->dhBufSize, false);
-        CopyOut(this->bdhLocal, this->bdhCastLocal, this->dhGm[lastDhOffset], this->dhBufSize);
+        // qCastLocal and qLocal do not overlap, unlike the reused bdh buffers.
+        for (uint64_t offset = 0; offset < this->dhBufSize; offset += this->qBufSize) {
+            const uint64_t remaining = this->dhBufSize - offset;
+            const uint32_t copyLen = static_cast<uint32_t>(remaining < this->qBufSize ? remaining : this->qBufSize);
+            CopyIn(this->qCastLocal, this->qCastLocal, this->dhtGm[gmOffsetState_ + offset], copyLen, false);
+            CopyOut(this->qLocal, this->qCastLocal, this->dhGm[lastDhOffset + offset], copyLen);
+        }
         CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_BDH);
     } else {
         InitOutput<DT>(this->dhGm[lastDhOffset], this->dhBufSize, 0);
@@ -327,16 +330,20 @@ __aicore__ inline void GDRVec<DT, GT>::ApplyGk(LocalTensor<float> bdh)
     }
     uint64_t lastToken = bos_ + this->curBT - 1;
     if constexpr (std::is_same<GT, float>::value) {
-        CopyIn(this->qCastLocal, this->qCastLocal, this->gkGm[gmOffsetGk_ + lastToken * this->K], this->halfK, false);
+        CopyIn(
+            this->qdoCastLocal, this->qdoCastLocal,
+            this->gkGm[gmOffsetGk_ + lastToken * this->K], this->halfK, false);
     } else {
-        CopyIn(this->qCastLocal, this->gLocal, this->gkGm[gmOffsetGk_ + lastToken * this->K], this->halfK);
+        CopyIn(
+            this->qdoCastLocal, this->gkLocal,
+            this->gkGm[gmOffsetGk_ + lastToken * this->K], this->halfK);
     }
-    Muls(this->qCastLocal, this->qCastLocal, LN2, this->halfK);
+    Muls(this->qdoCastLocal, this->qdoCastLocal, LN2, this->halfK);
     PipeBarrier<PIPE_V>();
-    Exp(this->qCastLocal, this->qCastLocal, this->halfK);
+    Exp(this->qdoCastLocal, this->qdoCastLocal, this->halfK);
     PipeBarrier<PIPE_V>();
     for (uint32_t row = 0; row < this->halfK; row++) {
-        float decay = this->qCastLocal.GetValue(row);
+        float decay = this->qdoCastLocal.GetValue(row);
         Muls(bdh[row * this->V], bdh[row * this->V], decay, this->V);
     }
 }
