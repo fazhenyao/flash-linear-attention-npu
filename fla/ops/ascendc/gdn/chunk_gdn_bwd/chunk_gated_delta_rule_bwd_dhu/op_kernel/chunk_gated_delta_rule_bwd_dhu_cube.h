@@ -60,6 +60,7 @@ public:
     using ElementW = DT;
     using ElementDo = DT;
     using ElementDv2 = DT;
+    using ElementBdh = float;
     using ElementAccumulator = float;
     using ElementInt = int64_t;
 
@@ -363,15 +364,19 @@ public:
                     {
                         gmGq.SetGlobalBuffer((__gm__ ElementGq *)params.workspace + params.gQWorkspaceOffset + coreIdx * params.BT * params.K);
                         gmDo.SetGlobalBuffer((__gm__ ElementDo *)params.dO + gmOffsetV + chunkIdx * params.BT * params.V);
-                        gmDhTerm1.SetGlobalBuffer((__gm__ ElementDh *)params.workspace + params.bdhTerm1WorkspaceOffset + coreIdx * params.K * params.V);
+                        gmDhTerm1.SetGlobalBuffer(
+                            (__gm__ ElementBdh *)((__gm__ uint8_t *)params.workspace + params.bdhTerm1WorkspaceOffset) +
+                            coreIdx * params.K * params.V);
                         
                         gmW.SetGlobalBuffer((__gm__ ElementW *)params.w + gmOffsetW + chunkIdx * params.BT * params.K);
                         gmDv2.SetGlobalBuffer((__gm__ ElementDv2 *)params.dv2 + gmOffsetV + chunkIdx * params.BT * params.V);
-                        gmDhTerm2.SetGlobalBuffer((__gm__ ElementDh *)params.workspace + params.bdhTerm2WorkspaceOffset + coreIdx * params.K * params.V);
+                        gmDhTerm2.SetGlobalBuffer(
+                            (__gm__ ElementBdh *)((__gm__ uint8_t *)params.workspace + params.bdhTerm2WorkspaceOffset) +
+                            coreIdx * params.K * params.V);
 
                         auto tensorGq = tla::MakeTensor(gmGq, params.layoutGq, Arch::PositionGM{});
                         auto tensorDo = tla::MakeTensor(gmDo, params.layoutDo, Arch::PositionGM{});
-                        auto tensorDh1 = tla::MakeTensor(gmDhTerm1, params.layoutDh, Arch::PositionGM{});
+                        auto tensorDh1 = tla::MakeTensor(gmDhTerm1, params.layoutBdh, Arch::PositionGM{});
                         auto tensorBlockGq = GetTile(tensorGq,
                                                     tla::MakeCoord(0,0),
                                                     tla::MakeShape(params.K, curBT));
@@ -384,7 +389,7 @@ public:
                         
                         auto tensorW = tla::MakeTensor(gmW, params.layoutW, Arch::PositionGM{});
                         auto tensorDv2 = tla::MakeTensor(gmDv2, params.layoutDv2, Arch::PositionGM{});
-                        auto tensorDh2 = tla::MakeTensor(gmDhTerm2, params.layoutDh, Arch::PositionGM{});
+                        auto tensorDh2 = tla::MakeTensor(gmDhTerm2, params.layoutBdh, Arch::PositionGM{});
                         auto tensorBlockW = GetTile(tensorW,
                                                     tla::MakeCoord(0,0),
                                                     tla::MakeShape(params.K, curBT));
@@ -565,11 +570,11 @@ private:
 
     AscendC::GlobalTensor<ElementGq> gmGq;
     AscendC::GlobalTensor<ElementDo> gmDo;
-    AscendC::GlobalTensor<ElementDh> gmDhTerm1;
+    AscendC::GlobalTensor<ElementBdh> gmDhTerm1;
     
     AscendC::GlobalTensor<ElementDh> gmW;
     AscendC::GlobalTensor<ElementDh> gmDv2;
-    AscendC::GlobalTensor<ElementDh> gmDhTerm2;
+    AscendC::GlobalTensor<ElementBdh> gmDhTerm2;
 
     AscendC::LocalTensor<DT> l1ATensorBdv;
     AscendC::LocalTensor<DT> l1BTensorBdv;
@@ -657,8 +662,8 @@ __aicore__ inline void GDRCube<DT, GT>::Process()
 {
     uint64_t bdvWorkspaceOffset = 0;
     uint64_t gQWorkspaceOffset = this->bdvWs;
-    uint64_t bdhTerm1WorkspaceOffset = gQWorkspaceOffset + this->qWs;
-    uint64_t bdhTerm2WorkspaceOffset = bdhTerm1WorkspaceOffset + this->qDoWs;
+    uint64_t bdhTerm1WorkspaceOffset = this->qDoWsOffset;
+    uint64_t bdhTerm2WorkspaceOffset = this->wDv2WsOffset;
     //输入
     using LayoutTagK = layout::RowMajor;
     using LayoutTagDh = layout::RowMajor;
@@ -684,7 +689,7 @@ __aicore__ inline void GDRCube<DT, GT>::Process()
 
     LayoutTagGq tagGq = LayoutTagGq::MakeLayout<ElementHalf>(this->K, this->chunkSize);
     LayoutTagDo tagDo = LayoutTagDo::MakeLayout<ElementHalf>(this->T, this->V);
-    LayoutTagBdh tagBdh = LayoutTagBdh::MakeLayout<ElementHalf>(this->K, this->V);
+    LayoutTagBdh tagBdh = LayoutTagBdh::MakeLayout<ElementFloat>(this->K, this->V);
 
     LayoutTagW tagW = LayoutTagW::MakeLayout<ElementHalf>(this->K, this->T);
     LayoutTagDv2 tagDv2 = LayoutTagDv2::MakeLayout<ElementHalf>(this->T, this->V);
@@ -716,9 +721,9 @@ __aicore__ inline void GDRCube<DT, GT>::Process()
     using L0TileShapeBdv = tla::Shape<_128, _256, _128>;
 
     using TileCopyDh1 = 
-            Gemm::Tile::PackedTileCopyTla<ArchTag, DT, LayoutTagGq, DT, LayoutTagDo, DT, LayoutTagBdh>;
+            Gemm::Tile::PackedTileCopyTla<ArchTag, DT, LayoutTagGq, DT, LayoutTagDo, float, LayoutTagBdh>;
     using TileCopyDh2 = 
-            Gemm::Tile::PackedTileCopyTla<ArchTag, DT, LayoutTagW, DT, LayoutTagDv2, DT, LayoutTagBdh>;
+            Gemm::Tile::PackedTileCopyTla<ArchTag, DT, LayoutTagW, DT, LayoutTagDv2, float, LayoutTagBdh>;
     using L1TileShapeDh = tla::Shape<_128, _256, _128>; // K,V, BT
     using L0TileShapeDh = tla::Shape<_128, _256, _128>;
     // kernel level

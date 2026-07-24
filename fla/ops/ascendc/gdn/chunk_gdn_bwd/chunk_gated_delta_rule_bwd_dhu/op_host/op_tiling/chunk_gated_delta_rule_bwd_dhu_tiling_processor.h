@@ -345,14 +345,25 @@ public:
         const uint64_t qWs = K_ * chunkSize_ * usedCoreNum;
         const uint64_t wDv2Ws = K_ * V_ * usedCoreNum;
         const uint64_t qDoWs = K_ * V_ * usedCoreNum;
-        const size_t usrWsSize =
-            static_cast<size_t>((bdvWs + qWs + wDv2Ws + qDoWs) * CHUNK_GDR_BWD_DHU_HALF_DTYPE_SIZE);
+        const uint64_t qDoWsOffset =
+            (bdvWs + qWs) * CHUNK_GDR_BWD_DHU_HALF_DTYPE_SIZE;
+        const uint64_t wDv2WsOffset =
+            qDoWsOffset + qDoWs * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE;
+        const uint64_t bdhWsOffset =
+            wDv2WsOffset + wDv2Ws * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE;
+        const uint64_t bdhWs = K_ * V_ * usedCoreNum;
+        const size_t usrWsSize = static_cast<size_t>(
+            bdhWsOffset + bdhWs * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE);
 
         workspaceSize_ = usrWsSize + ctx_.sysWorkspaceSize;
         tiling_.bdvWs = bdvWs;
         tiling_.qWs = qWs;
         tiling_.wDv2Ws = wDv2Ws;
         tiling_.qDoWs = qDoWs;
+        tiling_.qDoWsOffset = qDoWsOffset;
+        tiling_.wDv2WsOffset = wDv2WsOffset;
+        tiling_.bdhWsOffset = bdhWsOffset;
+        tiling_.bdhWs = bdhWs;
         return ge::GRAPH_SUCCESS;
     }
 

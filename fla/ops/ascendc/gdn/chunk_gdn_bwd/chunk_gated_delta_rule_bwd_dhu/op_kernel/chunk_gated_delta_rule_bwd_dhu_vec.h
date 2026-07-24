@@ -58,6 +58,7 @@ protected:
     uint64_t gatedQOffset_ = 0;
     uint64_t qdoOffset_ = 0;
     uint64_t wV2Offset_ = 0;
+    uint64_t bdhStateOffset_ = 0;
 
     int32_t curChunkNum_ = 0;
     uint64_t dhBlockSize_ = 0;
@@ -151,15 +152,14 @@ __aicore__ inline void GDRVec<DT, GT>::InitGlobalTensor(GM_ADDR q, GM_ADDR dv, G
     }
 
     // workspace
-    // | bdv | gatedQ | qDoWs | wDv2Ws |
+    // | DT bdv | DT gatedQ | FP32 qDoWs | FP32 wDv2Ws | FP32 bdhState |
     uint64_t wsOffset = 0;
     this->bdvGm.SetGlobalBuffer((__gm__ DT *)workspace + wsOffset);
     wsOffset += this->bdvWs; 
     this->gatedQGm.SetGlobalBuffer((__gm__ DT *)workspace + wsOffset);
-    wsOffset += this->qWs;
-    this->qdoGm.SetGlobalBuffer((__gm__ DT *)workspace + wsOffset);
-    wsOffset += this->qDoWs;
-    this->wv2Gm.SetGlobalBuffer((__gm__ DT *)workspace + wsOffset);
+    this->qdoGm.SetGlobalBuffer((__gm__ float *)((__gm__ uint8_t *)workspace + this->qDoWsOffset));
+    this->wv2Gm.SetGlobalBuffer((__gm__ float *)((__gm__ uint8_t *)workspace + this->wDv2WsOffset));
+    this->bdhStateGm.SetGlobalBuffer((__gm__ float *)((__gm__ uint8_t *)workspace + this->bdhWsOffset));
 }
 
 template <typename DT, typename GT>
@@ -280,6 +280,7 @@ __aicore__ inline void GDRVec<DT, GT>::CaclOffset(const uint32_t coarseTaskIdx, 
     gatedQOffset_ = cubeIdx_ * BT * this->K;
     qdoOffset_ = cubeIdx_ * dhBlockSize_;
     wV2Offset_ = cubeIdx_ * dhBlockSize_;
+    bdhStateOffset_ = cubeIdx_ * dhBlockSize_;
 
     gmOffsetK_ = (b * this->Hk + hq) * this->T * this->K + seqStartOffset * this->K;
     gmOffsetV_ = (b * this->Hv + h) * this->T * this->V + seqStartOffset * this->V;
@@ -301,6 +302,7 @@ __aicore__ inline void GDRVec<DT, GT>::CaclOffset(const uint32_t coarseTaskIdx, 
         gmOffsetG_ += this->halfBT;
         gmOffsetGk_ += this->halfK;
         gmOffsetState_ += this->halfK * this->V;
+        bdhStateOffset_ += this->halfK * this->V;
     }
 }
 
@@ -314,11 +316,13 @@ __aicore__ inline void GDRVec<DT, GT>::InitLastDh()
             const uint64_t remaining = this->dhBufSize - offset;
             const uint32_t copyLen = static_cast<uint32_t>(remaining < this->qBufSize ? remaining : this->qBufSize);
             CopyIn(this->qCastLocal, this->qCastLocal, this->dhtGm[gmOffsetState_ + offset], copyLen, false);
+            CopyOut(this->qCastLocal, this->qCastLocal, this->bdhStateGm[bdhStateOffset_ + offset], copyLen, false);
             CopyOut(this->qLocal, this->qCastLocal, this->dhGm[lastDhOffset + offset], copyLen);
         }
         CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_BDH);
     } else {
         InitOutput<DT>(this->dhGm[lastDhOffset], this->dhBufSize, 0);
+        InitOutput<float>(this->bdhStateGm[bdhStateOffset_], this->dhBufSize, 0);
     }
 }
 
@@ -433,7 +437,7 @@ __aicore__ inline void GDRVec<DT, GT>::UpdateDh(const float gLastExp, uint64_t& 
                                                 const bool isLastChunk)
 {
     curGmOffsetH = gmOffsetH_ + chunkIdx_ * dhBlockSize_;
-    CopyIn(this->bdhCastLocal, this->bdhLocal, this->dhGm[curGmOffsetH], this->dhBufSize);
+    CopyIn(this->bdhCastLocal, this->bdhCastLocal, this->bdhStateGm[bdhStateOffset_], this->dhBufSize, false);
     Muls(this->bdhCastLocal, this->bdhCastLocal, gLastExp, this->dhBufSize);
     ApplyGk(this->bdhCastLocal);
     if (chunkIdx_ == 0 && !this->hasH0) {
@@ -442,7 +446,7 @@ __aicore__ inline void GDRVec<DT, GT>::UpdateDh(const float gLastExp, uint64_t& 
     // dh_updated = dh_i-1 * exp2(bg_last) + term1*scale - term2
     CrossCoreWaitFlag(CROSS_CORE_C2V_TERM1); 
     {
-        CopyIn(this->qdoCastLocal, this->qdoLocal, this->qdoGm[qdoOffset_], this->dhBufSize);
+        CopyIn(this->qdoCastLocal, this->qdoCastLocal, this->qdoGm[qdoOffset_], this->dhBufSize, false);
         if (this->isScale) {
             Muls(this->qdoCastLocal, this->qdoCastLocal, this->scale, this->dhBufSize);
         }
@@ -450,13 +454,14 @@ __aicore__ inline void GDRVec<DT, GT>::UpdateDh(const float gLastExp, uint64_t& 
     }
     CrossCoreWaitFlag(CROSS_CORE_C2V_TERM2);
     {
-        CopyIn(this->wv2CastLocal, this->wv2Local, this->wv2Gm[wV2Offset_], this->dhBufSize);
+        CopyIn(this->wv2CastLocal, this->wv2CastLocal, this->wv2Gm[wV2Offset_], this->dhBufSize, false);
         Muls(this->wv2CastLocal, this->wv2CastLocal, static_cast<float>(-1.0), this->dhBufSize);
         Add(this->qdoCastLocal, this->qdoCastLocal, this->wv2CastLocal, this->dhBufSize);
     }
     if (chunkIdx_ == 0) {
         CopyOut(this->qdoCastLocal, this->qdoCastLocal, this->dh0Gm[gmOffsetState_], this->dhBufSize, false);
     } else {
+        CopyOut(this->qdoCastLocal, this->qdoCastLocal, this->bdhStateGm[bdhStateOffset_], this->dhBufSize, false);
         CopyOut(this->bdhLocal, this->qdoCastLocal, this->dhGm[curGmOffsetH - dhBlockSize_], this->dhBufSize);
         CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_BDH);
     }

@@ -69,9 +69,10 @@ protected:
     GlobalTensor<float> dh0Gm;
     // inprocess workspace gm
     GlobalTensor<DT> bdvGm;
-    GlobalTensor<DT> wv2Gm;
-    GlobalTensor<DT> qdoGm;
+    GlobalTensor<float> wv2Gm;
+    GlobalTensor<float> qdoGm;
     GlobalTensor<DT> gatedQGm;
+    GlobalTensor<float> bdhStateGm;
     
     // calc gated q
     LocalTensor<DT> qLocal; // [BT/2,K]
@@ -118,6 +119,10 @@ protected:
     uint64_t qWs = 0;
     uint64_t wDv2Ws = 0;
     uint64_t qDoWs = 0;
+    uint64_t qDoWsOffset = 0;
+    uint64_t wDv2WsOffset = 0;
+    uint64_t bdhWsOffset = 0;
+    uint64_t bdhWs = 0;
     uint64_t isVarLen = 0;
     uint64_t isScale = 0;
     uint64_t hasGk = 0;
@@ -159,6 +164,10 @@ __aicore__ inline void GDRBase<DT, GT>::InitTilingData(const ChunkGatedDeltaRule
     this->qWs = tilingData.qWs;
     this->wDv2Ws = tilingData.wDv2Ws;
     this->qDoWs = tilingData.qDoWs;
+    this->qDoWsOffset = tilingData.qDoWsOffset;
+    this->wDv2WsOffset = tilingData.wDv2WsOffset;
+    this->bdhWsOffset = tilingData.bdhWsOffset;
+    this->bdhWs = tilingData.bdhWs;
     this->isVarLen = tilingData.isVarLen;
     this->isScale = tilingData.isScale;
     this->hasGk = tilingData.hasGk;

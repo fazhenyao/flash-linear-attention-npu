@@ -609,7 +609,7 @@ def test_state_and_gk(
     B: int = 1,
     Hk: int = 1,
     Hv: int = 1,
-    T: int = 128,
+    T: int = 320,
     K: int = 64,
     V: int = 32,
     chunk_size: int = 64,
