@@ -464,25 +464,22 @@ public:
                                                     tla::MakeShape(params.K, params.V));                        
                         // gatedQ @ do
                         // | bdv coreNum * K * V | gQ coreNum * BT * K | qDo coreNum * K * V | wDv2 coreNum * K * V | 
-                        PipeBarrier<PIPE_ALL>();
                         // load L1B
-                        
-                        copyGmToL1B_Dh1(tensorL1B1, tensorGmTileB1);
-                        PipeBarrier<PIPE_ALL>();
-                        
-                        // w @ dv2 load L1A
 
+                        copyGmToL1B_Dh1(tensorL1B1, tensorGmTileB1);
+                        constexpr uint32_t EVENT_TERM_PRELOAD_L1B = 1;
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_TERM_PRELOAD_L1B);
+
+                        // w @ dv2 load L1A
                         copyGmToL1A_Dh2(tensorL1A2, tensorGmTileA2);
-                        // PipeBarrier<PIPE_ALL>();
 
                         // copy L1B -> L0B
-
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_TERM_PRELOAD_L1B);
                         copyL1ToL0B_Dh1(tensorL0B1, tensorTileL1B1);
                         PipeBarrier<PIPE_ALL>();
 
                         // copy L1A -> L0A
                         copyL1ToL0A_Dh2(tensorL0A2, tensorTileL1A2);
-                        // PipeBarrier<PIPE_ALL>();
 
                         // load L1A
                         CrossCoreWaitFlag(CROSS_CORE_V2C_GQ); // vec计算完一个chunk的gatedQ,通知cube可以开始计算对应的dh term1
@@ -490,35 +487,41 @@ public:
                         PipeBarrier<PIPE_ALL>();
 
                         // copy L1A -> L0A
-
                         copyL1ToL0A_Dh1(tensorL0A1, tensorTileL1A1);
                         PipeBarrier<PIPE_ALL>();
 
-
+                        constexpr uint32_t EVENT_TERM_L1B = 0;
+                        constexpr uint32_t EVENT_TERM_L0B = 0;
+                        constexpr uint32_t EVENT_TERM_L0C = 0;
                         tileMmadDh1(tensorTileL0C1, tensorL0A1, tensorL0B1, initC, unitFlag);
-                        PipeBarrier<PIPE_ALL>();
-                        copyL0CToGm_Dh1(tensorBlockDh1, tensorL0C1);
-                        PipeBarrier<PIPE_ALL>();
+                        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_TERM_L0B);
+                        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM_L0C);
+
+                        // Prefetch dv2 while term1 is running; the two operands use independent L1 buffers.
+                        CrossCoreWaitFlag(CROSS_CORE_V2C_DV2);
+                        copyGmToL1B_Dh2(tensorL1B2, tensorGmTileB2);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_TERM_L1B);
+
+                        // Overlap term1 FIX writeback with the term2 L1-to-L0B transfer.
+                        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_TERM_L0B);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_TERM_L1B);
+                        copyL1ToL0B_Dh2(tensorL0B2, tensorTileL1B2);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_TERM_L0B);
+
+                        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM_L0C);
+                        copyL0CToGm_Dh1(tensorBlockDh1, tensorL0C1, unitFlag);
+                        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM_L0C);
+                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM_L0C);
                         CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_TERM1);
 
                         // w @ dv2 -> bdh_term2
-                        // PipeBarrier<PIPE_ALL>();
-                        // load L1B
-                        CrossCoreWaitFlag(CROSS_CORE_V2C_DV2);
-                        copyGmToL1B_Dh2(tensorL1B2, tensorGmTileB2);
-                        PipeBarrier<PIPE_ALL>();
-
-                        // copy L1B -> L0B
-
-                        copyL1ToL0B_Dh2(tensorL0B2, tensorTileL1B2);
-                        PipeBarrier<PIPE_ALL>();
-
-                        // bool initC = true; //k方向没有循环
-                        // uint8_t unitFlag = 0;
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_TERM_L0B);
                         tileMmadDh2(tensorTileL0C2, tensorL0A2, tensorL0B2, initC, unitFlag);
-                        PipeBarrier<PIPE_ALL>();
-                        copyL0CToGm_Dh2(tensorBlockDh2, tensorL0C2);
-                        PipeBarrier<PIPE_ALL>();
+                        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM_L0C);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM_L0C);
+                        copyL0CToGm_Dh2(tensorBlockDh2, tensorL0C2, unitFlag);
+                        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM_L0C);
+                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM_L0C);
                         CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_TERM2);
                     }
                 }
