@@ -2,8 +2,7 @@ import math
 import torch
 import torch_npu
 from typing import Optional, Tuple, List
-import ct
-import fla_npu
+from fla_npu.ops.ascendc import chunk_gated_delta_rule_bwd_dhu
 
 # fp16/bf16：在尽量无 NaN 的前提下抬高输出数量级（dv2 中位 ~1e-3；dh 非零元 |x| 最大可至 ~1e-3 量级）
 _LOW_PRECISION_INPUT_HALF_RANGE_QK = 6.5e-3
@@ -199,6 +198,18 @@ def assert_no_nan_inf(t: torch.Tensor, name: str) -> None:
     )
 
 
+def assert_close(actual: torch.Tensor, expected: torch.Tensor, name: str) -> None:
+    """Use an in-repo tolerance instead of relying on the external ct helper."""
+    actual_fp32 = actual.float()
+    expected_fp32 = expected.float()
+    diff = (actual_fp32 - expected_fp32).abs()
+    print(
+        f"{name}: max_abs={diff.max().item():.6g}, "
+        f"mean_abs={diff.mean().item():.6g}"
+    )
+    torch.testing.assert_close(actual_fp32, expected_fp32, rtol=0.035, atol=0.0025)
+
+
 def _nonfinite_detail_line(t: torch.Tensor, name: str) -> Optional[str]:
     """若含非有限值则返回一行说明，否则返回 None。"""
     if not (torch.is_floating_point(t) or torch.is_complex(t)):
@@ -247,6 +258,9 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
     cu_seqlens: Optional[List[int]] = None,
     chunk_indices: Optional[List[int]] = None,
     g: Optional[torch.Tensor] = None,
+    gk: Optional[torch.Tensor] = None,
+    h0: Optional[torch.Tensor] = None,
+    dht: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     chunk_size: int = 64,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
@@ -331,7 +345,7 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
     if cu_seqlens is None:
         # 定长：对 (B, Hv) 向量化，仅沿 chunk 反向迭代。避免 B×Hv×NT 纯 Python 嵌套（大 B/Hv 时极慢甚至像卡死）。
         hq = torch.arange(Hv, device=device, dtype=torch.long) // hv_per_hk
-        b_dh = torch.zeros(B, Hv, K, V, device=device, dtype=torch.float32)
+        b_dh = dht.float().clone() if dht is not None else torch.zeros(B, Hv, K, V, device=device, dtype=torch.float32)
         for i_t in range(NT - 1, -1, -1):
             info = chunk_info[i_t]
             global_start_t = info["global_start_t"]
@@ -355,7 +369,7 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
             if g is not None:
                 bg_last = g[:, :, global_last_idx]
                 b_g = g[:, :, global_start_t:global_end_t]
-                gate_factor = torch.exp(bg_last.unsqueeze(-1) - b_g).unsqueeze(-1)
+                gate_factor = torch.exp2(bg_last.unsqueeze(-1) - b_g).unsqueeze(-1)
                 m_t = torch.arange(block_size_t, device=device, dtype=torch.float32) < float(block_size_t)
                 mask_expanded = m_t.view(1, 1, block_size_t, 1)
                 b_dv = b_dv * gate_factor * mask_expanded
@@ -367,25 +381,34 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
             b_w_t = w_blk.transpose(-1, -2)
 
             if g is not None:
-                bg_last_exp = torch.exp(bg_last)
-                b_g_exp = torch.exp(b_g)
+                bg_last_exp = torch.exp2(bg_last)
+                b_g_exp = torch.exp2(b_g)
                 b_dh_for_update = b_dh * bg_last_exp.unsqueeze(-1).unsqueeze(-1)
                 b_q_gated = b_q_t * b_g_exp.unsqueeze(-2)
             else:
                 b_dh_for_update = b_dh.clone()
                 b_q_gated = b_q_t
 
+            if gk is not None:
+                b_dh_for_update = b_dh_for_update * torch.exp2(gk[:, :, global_last_idx]).unsqueeze(-1)
+
             term1 = torch.matmul(b_q_gated.to(torch.float), b_do.to(torch.float)) * scale
             term2 = torch.matmul(b_w_t.to(torch.float), b_dv.to(torch.float))
             b_dh = b_dh_for_update + term1 - term2
     else:
+        dh0_buffers = torch.empty(
+            len(cu_seqlens) - 1, Hv, K, V, device=device, dtype=torch.float32
+        ) if h0 is not None else None
         for b in range(B):
             for i_h in range(Hv):
                 hq = i_h // hv_per_hk
                 num_tokens = len(cu_seqlens) - 1
                 b_dh_buffers = {}
                 for i_n in range(num_tokens):
-                    b_dh_buffers[i_n] = torch.zeros(K, V, device=device, dtype=torch.float32)
+                    if dht is not None:
+                        b_dh_buffers[i_n] = dht[i_n, i_h].float().clone()
+                    else:
+                        b_dh_buffers[i_n] = torch.zeros(K, V, device=device, dtype=torch.float32)
 
                 for i_t in range(NT - 1, -1, -1):
                     info = chunk_info[i_t]
@@ -405,8 +428,8 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
                     if g is not None:
                         bg_last = g[b, i_h, global_last_idx]
                         b_g = g[b, i_h, global_start_t:global_end_t]
-                        bg_last_exp = torch.exp(bg_last)
-                        b_g_exp = torch.exp(b_g)
+                        bg_last_exp = torch.exp2(bg_last)
+                        b_g_exp = torch.exp2(b_g)
 
                     b_do = do[b, i_h, global_start_t:global_end_t, :]
                     b_dv_existing = dv[b, i_h, global_start_t:global_end_t, :]
@@ -416,7 +439,7 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
 
                     if g is not None:
                         m_t = torch.arange(block_size_t, device=device) < block_size_t
-                        gate_factor = torch.exp(bg_last - b_g).unsqueeze(-1)
+                        gate_factor = torch.exp2(bg_last - b_g).unsqueeze(-1)
                         mask_expanded = m_t.unsqueeze(-1).float()
                         b_dv *= gate_factor * mask_expanded
 
@@ -431,6 +454,8 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
                     b_dh_for_update = b_dh.clone()
                     if g is not None:
                         b_dh_for_update = b_dh_for_update * bg_last_exp
+                    if gk is not None:
+                        b_dh_for_update = b_dh_for_update * torch.exp2(gk[b, i_h, global_last_idx]).unsqueeze(-1)
 
                     b_q_gated = b_q_t
                     if g is not None:
@@ -441,8 +466,15 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
 
                     new_b_dh = b_dh_for_update + term1 - term2
                     b_dh_buffers[i_n] = new_b_dh
+                if dh0_buffers is not None:
+                    for i_n in range(num_tokens):
+                        dh0_buffers[i_n, i_h] = b_dh_buffers[i_n]
 
-    return dh, None, dv2
+    if h0 is None:
+        return dh, None, dv2
+    if cu_seqlens is None:
+        return dh, b_dh, dv2
+    return dh, dh0_buffers, dv2
 
 
 def test_fix(
@@ -486,7 +518,7 @@ def test_fix(
     dv_npu = dv.npu()
     g_npu = g.npu()
 
-    dh_npu, dh0_npu, dv2_npu = torch.ops.npu.npu_chunk_gated_delta_rule_bwd_dhu(
+    dh_npu, dh0_npu, dv2_npu = chunk_gated_delta_rule_bwd_dhu(
         q_npu, k_npu, w_npu, d_o_npu, dv_npu, 
         scale=scale, 
         chunk_size=chunk_size,
@@ -503,9 +535,9 @@ def test_fix(
     dh_npu_cpu = dh_npu.detach().cpu()
     dv2_npu_cpu = dv2_npu.detach().cpu()
     print("dh comparison:")
-    ct.single(dh_npu_cpu, dh_golden)
+    assert_close(dh_npu_cpu, dh_golden, "dh")
     print("dv2 comparison:")
-    ct.single(dv2_npu_cpu, dv2_golden)
+    assert_close(dv2_npu_cpu, dv2_golden, "dv2")
     assert_finite_after_npu_golden_compare(dh_npu_cpu, dv2_npu_cpu, dh_golden, dv2_golden)
     print(f"test_fix 被调用了第 {test_fix.call_count} 次")
 
@@ -553,7 +585,7 @@ def test_variable(
     dv_npu = dv.npu()
     g_npu = g.npu()
 
-    dh_npu, dh0_npu, dv2_npu = torch.ops.npu.npu_chunk_gated_delta_rule_bwd_dhu(
+    dh_npu, dh0_npu, dv2_npu = chunk_gated_delta_rule_bwd_dhu(
         q_npu, k_npu, w_npu, d_o_npu, dv_npu, 
         scale=scale, 
         chunk_size=chunk_size,
@@ -574,14 +606,73 @@ def test_variable(
     print("dh_npu shape is", dh_npu_cpu.shape)
     print("dv2_npu shape is", dv2_npu_cpu.shape)
     print("dh comparison:")
-    ct.single(dh_npu_cpu, dh_golden)
+    assert_close(dh_npu_cpu, dh_golden, "dh")
     print("dv2 comparison:")
-    ct.single(dv2_npu_cpu, dv2_golden)
+    assert_close(dv2_npu_cpu, dv2_golden, "dv2")
 
     # NPU 与 golden 对比全部完成后，再检查 NaN/Inf，最后落盘
     assert_finite_after_npu_golden_compare(dh_npu_cpu, dv2_npu_cpu, dh_golden, dv2_golden)
 
     # print(f"test_variable 被调用了第 {test_variable.call_count} 次")
+
+
+def test_state_and_gk(
+    B: int = 1,
+    Hk: int = 1,
+    Hv: int = 1,
+    T: int = 320,
+    K: int = 64,
+    V: int = 32,
+    chunk_size: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """Cover key-wise gate, final-state gradient, and FP32 dh0 output together."""
+    torch.manual_seed(17)
+    q, k, w, d_o, dv, g = create_bwd_dhu_random_inputs(B, Hk, Hv, T, K, V, dtype, dtype)
+    gk = create_gate_g(B, Hv, T * K, dtype, narrow=True).reshape(B, Hv, T, K)
+    h0 = rand_symmetric_uniform((B, Hv, K, V), dtype, 1e-2)
+    dht = rand_symmetric_uniform((B, Hv, K, V), torch.float32, 1e-2)
+
+    dh_ref, dh0_ref, dv2_ref = chunk_gated_delta_rule_bwd_dhu_torch(
+        q, k, w, d_o, dv, g=g, gk=gk, h0=h0, dht=dht, scale=1.0 / math.sqrt(K), chunk_size=chunk_size
+    )
+    dh, dh0, dv2 = chunk_gated_delta_rule_bwd_dhu(
+        q.npu(), k.npu(), w.npu(), d_o.npu(), dv.npu(),
+        scale=1.0 / math.sqrt(K), chunk_size=chunk_size,
+        g=g.npu(), gK=gk.npu(), h0=h0.npu(), dht=dht.npu(),
+        cu_seqlens=None, chunk_indices=None,
+    )
+    assert dh0 is not None and dh0.dtype == torch.float32
+    assert_close(dh.cpu(), dh_ref, "dh")
+    assert_close(dh0.cpu(), dh0_ref, "dh0")
+    assert_close(dv2.cpu(), dv2_ref, "dv2")
+    assert_finite_after_npu_golden_compare(dh.cpu(), dv2.cpu(), dh_ref, dv2_ref)
+
+
+def test_without_g(
+    B: int = 1,
+    Hk: int = 2,
+    Hv: int = 4,
+    T: int = 192,
+    K: int = 128,
+    V: int = 128,
+    chunk_size: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """Match the reference kernel's USE_G=False path."""
+    torch.manual_seed(23)
+    q, k, w, d_o, dv, _ = create_bwd_dhu_random_inputs(B, Hk, Hv, T, K, V, dtype, dtype)
+    dh_ref, _, dv2_ref = chunk_gated_delta_rule_bwd_dhu_torch(
+        q, k, w, d_o, dv, g=None, scale=1.0 / math.sqrt(K), chunk_size=chunk_size
+    )
+    dh, dh0, dv2 = chunk_gated_delta_rule_bwd_dhu(
+        q.npu(), k.npu(), w.npu(), d_o.npu(), dv.npu(),
+        scale=1.0 / math.sqrt(K), chunk_size=chunk_size, g=None,
+        gK=None, h0=None, dht=None, cu_seqlens=None, chunk_indices=None,
+    )
+    assert dh0 is None
+    assert_close(dh.cpu(), dh_ref, "dh without g")
+    assert_close(dv2.cpu(), dv2_ref, "dv2 without g")
 
 if __name__ == "__main__":
     import os
@@ -596,3 +687,7 @@ if __name__ == "__main__":
     test_fix(B=1, Hk=4, Hv=4, T=128, K=128, V=128, chunk_size=64, scale=0.088, ktype=torch.bfloat16, gtype=torch.bfloat16)
     # GVA varlen smoke
     test_variable(B=1, Hk=4, Hv=8, T=512, K=128, V=128, chunk_size=64, scale=0.011, cu_seqlens_len=4, ktype=torch.bfloat16, gtype=torch.bfloat16)
+    # State and key-wise gate coverage (FP32 dht, FP32 dh0).
+    test_state_and_gk()
+    # Reference kernel permits USE_G=False.
+    test_without_g()

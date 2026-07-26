@@ -59,15 +59,18 @@ protected:
     // inputGm
     GlobalTensor<DT> qGm;
     GlobalTensor<GT> gGm;
+    GlobalTensor<GT> gkGm;
+    GlobalTensor<float> dhtGm;
     GlobalTensor<DT> dvGm;
     GlobalTensor<int64_t> cuSeqlensGm;
     // output gm, also used as input
     GlobalTensor<DT> dv2Gm;
     GlobalTensor<DT> dhGm;
+    GlobalTensor<float> dh0Gm;
     // inprocess workspace gm
     GlobalTensor<DT> bdvGm;
-    GlobalTensor<DT> wv2Gm;
-    GlobalTensor<DT> qdoGm;
+    GlobalTensor<float> wv2Gm;
+    GlobalTensor<float> qdoGm;
     GlobalTensor<DT> gatedQGm;
     
     // calc gated q
@@ -89,10 +92,8 @@ protected:
     // updated dh
     LocalTensor<DT> bdhLocal; // [K/2,V]
     LocalTensor<float> bdhCastLocal;
-    LocalTensor<DT> wv2Local; // [K/2,V]
-    LocalTensor<float> wv2CastLocal;
-    LocalTensor<DT> qdoLocal; // [K/2,V]
     LocalTensor<float> qdoCastLocal;
+    LocalTensor<GT> gkLocal;
     
     // tiling data
     uint64_t B = 0;
@@ -114,8 +115,14 @@ protected:
     uint64_t qWs = 0;
     uint64_t wDv2Ws = 0;
     uint64_t qDoWs = 0;
+    uint64_t qDoWsOffset = 0;
+    uint64_t wDv2WsOffset = 0;
     uint64_t isVarLen = 0;
     uint64_t isScale = 0;
+    uint64_t hasG = 0;
+    uint64_t hasGk = 0;
+    uint64_t hasH0 = 0;
+    uint64_t hasDht = 0;
     uint32_t usedCoreNum = 0;
     float  scale = 0;
 
@@ -152,8 +159,14 @@ __aicore__ inline void GDRBase<DT, GT>::InitTilingData(const ChunkGatedDeltaRule
     this->qWs = tilingData.qWs;
     this->wDv2Ws = tilingData.wDv2Ws;
     this->qDoWs = tilingData.qDoWs;
+    this->qDoWsOffset = tilingData.qDoWsOffset;
+    this->wDv2WsOffset = tilingData.wDv2WsOffset;
     this->isVarLen = tilingData.isVarLen;
     this->isScale = tilingData.isScale;
+    this->hasG = tilingData.hasG;
+    this->hasGk = tilingData.hasGk;
+    this->hasH0 = tilingData.hasH0;
+    this->hasDht = tilingData.hasDht;
     this->usedCoreNum = tilingData.usedCoreNum;
     this->scale = tilingData.scale;
     this->coreIdx = GetBlockIdx();
@@ -217,6 +230,38 @@ __aicore__ inline void CopyOut(const LocalTensor<CAST_DT>& castLocal, const Loca
         DataCopyPad(dstGM, castLocal, dataCopyExtParams);
     }
 
+    SetFlag<HardEvent::MTE3_V>(EVENT_MTE3_V);
+    WaitFlag<HardEvent::MTE3_V>(EVENT_MTE3_V);
+}
+
+template <typename T>
+__aicore__ inline void CopyInRaw(const LocalTensor<T>& dstLocal, const GlobalTensor<T>& srcGM, const uint32_t len)
+{
+    SetFlag<HardEvent::V_MTE2>(EVENT_V_MTE2);
+    WaitFlag<HardEvent::V_MTE2>(EVENT_V_MTE2);
+    PipeBarrier<PIPE_MTE2>();
+    if (len % BLOCK_SIZE == 0) {
+        DataCopy(dstLocal, srcGM, len);
+    } else {
+        DataCopyExtParams dataCopyExtParams{1, static_cast<uint32_t>(len * sizeof(T)), 0, 0, 0};
+        DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
+        DataCopyPad(dstLocal, srcGM, dataCopyExtParams, padParams);
+    }
+    SetFlag<HardEvent::MTE2_V>(EVENT_MTE2_V);
+    WaitFlag<HardEvent::MTE2_V>(EVENT_MTE2_V);
+}
+
+template <typename T>
+__aicore__ inline void CopyOutRaw(const GlobalTensor<T>& dstGM, const LocalTensor<T>& srcLocal, const uint32_t len)
+{
+    SetFlag<HardEvent::V_MTE3>(EVENT_V_MTE3);
+    WaitFlag<HardEvent::V_MTE3>(EVENT_V_MTE3);
+    if (len % BLOCK_SIZE == 0) {
+        DataCopy(dstGM, srcLocal, len);
+    } else {
+        DataCopyExtParams dataCopyExtParams{1, static_cast<uint32_t>(len * sizeof(T)), 0, 0, 0};
+        DataCopyPad(dstGM, srcLocal, dataCopyExtParams);
+    }
     SetFlag<HardEvent::MTE3_V>(EVENT_MTE3_V);
     WaitFlag<HardEvent::MTE3_V>(EVENT_MTE3_V);
 }
