@@ -206,7 +206,22 @@ bool ResolveChunkLocalCumsumOutputDtype(
     c10::optional<bool> use_exp2, 
     c10::optional<bool> transpose_state_layout)
 {
-    // GVA：q/k 为 [B,Hk,T,K]；w、d_o、dv、g 等为 [B,Hv,T,·]，且 Hv % Hk == 0（与 device tiling 一致）
+    constexpr const char *op_name = "npu_chunk_gated_delta_rule_bwd_dhu";
+    TORCH_CHECK(!use_exp2.value_or(false), op_name, ": use_exp2 is reserved and only false is supported.");
+    TORCH_CHECK(!transpose_state_layout.value_or(false),
+                op_name,
+                ": transpose_state_layout is reserved and only false is supported.");
+    TORCH_CHECK(g.has_value(), op_name, ": g is required.");
+    TORCH_CHECK(chunk_size == 64 || chunk_size == 128,
+                op_name,
+                ": chunk_size must be 64 or 128, but got ",
+                chunk_size,
+                ".");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && w.dim() == 4 && d_o.dim() == 4 && dv.dim() == 4,
+                op_name,
+                ": q, k, w, d_o, and dv must all be 4D tensors.");
+
+    // q/k use key heads while w/d_o/dv/g use value heads.
     auto q_size = q.sizes();
     auto k_size = k.sizes();
     auto w_size = w.sizes();
@@ -218,7 +233,14 @@ bool ResolveChunkLocalCumsumOutputDtype(
     int64_t K = q_size[3];
     int64_t Hv = dv_size[1];
     int64_t V = dv_size[3];
-    int64_t chunk_num = (T + chunk_size -1) / chunk_size;
+    int64_t chunk_num = CeilDiv(T, chunk_size);
+
+    CheckKdaCuSeqlens(cu_seqlens, T, op_name);
+    CheckKdaChunkIndices(chunk_indices, cu_seqlens, chunk_size, op_name);
+    TORCH_CHECK(cu_seqlens.has_value() == chunk_indices.has_value(),
+                op_name,
+                ": cu_seqlens and chunk_indices must both be provided or both be omitted.");
+    TORCH_CHECK(!cu_seqlens.has_value() || B == 1, op_name, ": varlen mode requires B=1.");
 
     TORCH_CHECK(
         k_size[0] == B && k_size[1] == Hk && k_size[2] == T && k_size[3] == K,
@@ -244,12 +266,14 @@ bool ResolveChunkLocalCumsumOutputDtype(
         chunk_num = chunk_indices_ref.size() / 2;
     }
 
-    // 创建输出 tensor：dh/dh0 与 value 头维 Hv 对齐（device 输出 [B,Hv,chunk_num,K,V]）
+    int64_t state_batch = GetKdaSeqNum(B, cu_seqlens);
+
+    // The NPU public layout keeps the chunk axis after the value-head axis.
     at::Tensor dv2 = at::empty_like(dv);
     at::Tensor dh = at::empty({B, Hv, chunk_num, K, V}, q.options());
     at::Tensor dh0;
     if (h0.has_value()) {
-        dh0 = at::empty({B, Hv, chunk_num, K, V}, q.options());
+        dh0 = at::empty({state_batch, Hv, K, V}, q.options().dtype(at::kFloat));
     } else {
         dh0 = at::Tensor();
     }
@@ -260,22 +284,36 @@ bool ResolveChunkLocalCumsumOutputDtype(
     const at::Tensor &h0_ = c10::value_or_else(h0, [] { return at::Tensor(); });
     const at::Tensor &dht_ = c10::value_or_else(dht, [] { return at::Tensor(); });
 
-    if (g_.defined()) {
-        TORCH_CHECK(
-            g_.dim() == 3 && g_.size(0) == B && g_.size(1) == Hv && g_.size(2) == T,
-            "npu_chunk_gated_delta_rule_bwd_dhu: g must be [B,Hv,T]; g=", g_.sizes());
+    TORCH_CHECK(g_.dim() == 3 && g_.size(0) == B && g_.size(1) == Hv && g_.size(2) == T,
+                op_name,
+                ": g must be [B,Hv,T]; g=",
+                g_.sizes());
+    TORCH_CHECK(g_.scalar_type() == q.scalar_type() || g_.scalar_type() == at::kFloat,
+                op_name,
+                ": g must have the same dtype as q or be float32.");
+    if (gK_.defined()) {
+        TORCH_CHECK(gK_.dim() == 4 && gK_.size(0) == B && gK_.size(1) == Hv && gK_.size(2) == T &&
+                        gK_.size(3) == K,
+                    op_name,
+                    ": gK must be [B,Hv,T,K]; gK=",
+                    gK_.sizes());
+        TORCH_CHECK(gK_.scalar_type() == g_.scalar_type(), op_name, ": gK must have the same dtype as g.");
     }
     if (h0_.defined()) {
-        TORCH_CHECK(
-            h0_.dim() == 5 && h0_.size(0) == B && h0_.size(1) == Hv && h0_.size(2) == chunk_num,
-            "npu_chunk_gated_delta_rule_bwd_dhu: h0 must be [B,Hv,chunk_num,K,V]; h0=", h0_.sizes(),
-            " chunk_num=", chunk_num);
+        TORCH_CHECK(h0_.dim() == 4 && h0_.size(0) == state_batch && h0_.size(1) == Hv && h0_.size(2) == K &&
+                        h0_.size(3) == V,
+                    op_name,
+                    ": h0 must be [N,Hv,K,V]; h0=",
+                    h0_.sizes());
+        TORCH_CHECK(h0_.scalar_type() == q.scalar_type(), op_name, ": h0 must have the same dtype as q.");
     }
     if (dht_.defined()) {
-        TORCH_CHECK(
-            dht_.dim() == 5 && dht_.size(0) == B && dht_.size(1) == Hv && dht_.size(2) == chunk_num,
-            "npu_chunk_gated_delta_rule_bwd_dhu: dht must be [B,Hv,chunk_num,K,V]; dht=", dht_.sizes(),
-            " chunk_num=", chunk_num);
+        TORCH_CHECK(dht_.dim() == 4 && dht_.size(0) == state_batch && dht_.size(1) == Hv && dht_.size(2) == K &&
+                        dht_.size(3) == V,
+                    op_name,
+                    ": dht must be [N,Hv,K,V]; dht=",
+                    dht_.sizes());
+        TORCH_CHECK(dht_.scalar_type() == at::kFloat, op_name, ": dht must be float32.");
     }
 
     // 调用ACLNN算子
