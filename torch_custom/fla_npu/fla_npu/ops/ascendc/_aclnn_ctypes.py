@@ -218,13 +218,67 @@ def npu_chunk_gated_delta_rule_bwd_dhu(
     use_exp2=False,
     transpose_state_layout=False,
 ):
+    import torch
+
+    use_exp2 = _optional_bool(use_exp2, False)
+    transpose_state_layout = _optional_bool(transpose_state_layout, False)
+    if use_exp2:
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: use_exp2 must be False.")
+    if transpose_state_layout:
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: transpose_state_layout must be False.")
+    if int(chunk_size) not in (64, 128):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: chunk_size must be 64 or 128.")
+
     q_shape = _shape(q)
+    k_shape = _shape(k)
+    w_shape = _shape(w)
+    do_shape = _shape(d_o)
     dv_shape = _shape(dv)
-    B, _, T, K = q_shape
+    if any(len(shape) != 4 for shape in (q_shape, k_shape, w_shape, do_shape, dv_shape)):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: q/k/w/d_o/dv must all be rank 4.")
+    B, Hk, T, K = q_shape
     Hv, V = dv_shape[1], dv_shape[3]
+    if K != 128 or V not in (128, 256):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: K must be 128 and V must be 128 or 256.")
+    if k_shape != q_shape:
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: k must match q as [B,Hk,T,K].")
+    if w_shape != (B, Hv, T, K):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: w must be [B,Hv,T,K].")
+    if do_shape != (B, Hv, T, V) or dv_shape != (B, Hv, T, V):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: d_o and dv must be [B,Hv,T,V].")
+    if Hk <= 0 or Hv <= 0 or Hv % Hk != 0:
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: Hv must be divisible by Hk.")
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: q must be float16 or bfloat16.")
+    if any(tensor.dtype != q.dtype for tensor in (k, w, d_o, dv)):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: q/k/w/d_o/dv must have the same dtype.")
+    # The A2 FP32 gK-only template is unstable on this CANN line. Rounding gK
+    # to the matmul input dtype matches the stable low-precision kernel path.
+    if g is None and gK is not None and gK.dtype == torch.float32:
+        gK = gK.to(q.dtype)
+    gate_dtype = g.dtype if g is not None else (gK.dtype if gK is not None else q.dtype)
+    if gate_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: g/gK must be float16, bfloat16, or float32.")
+    if g is not None and (_shape(g) != (B, Hv, T) or g.dtype != gate_dtype):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: g must be [B,Hv,T] and match gK dtype.")
+    if gK is not None and (_shape(gK) != (B, Hv, T, K) or gK.dtype != gate_dtype):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: gK must be [B,Hv,T,K] and match g dtype.")
+    if (cu_seqlens is None) != (chunk_indices is None):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: cu_seqlens and chunk_indices must be provided together.")
+    if chunk_indices is not None and len(chunk_indices) % 2 != 0:
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: chunk_indices must contain [sequence, chunk] pairs.")
     NT = _chunk_num(T, int(chunk_size), chunk_indices)
-    dh = _empty((B, Hv, NT, K, V), q)
-    dh0 = _empty((B, Hv, NT, K, V), q) if h0 is not None else None
+    dh = _empty((B, NT, Hv, K, V), q)
+    state_batch = len(cu_seqlens) - 1 if cu_seqlens is not None else B
+    state_shape = (state_batch, Hv, K, V)
+    if h0 is not None and (_shape(h0) != state_shape or h0.dtype != q.dtype):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: h0 must be [state_batch,Hv,K,V] with q dtype.")
+    if dht is not None and (_shape(dht) != state_shape or dht.dtype != torch.float32):
+        raise RuntimeError("npu_chunk_gated_delta_rule_bwd_dhu: dht must be [state_batch,Hv,K,V] with float32 dtype.")
+    if h0 is not None:
+        dh0 = _empty((state_batch, Hv, K, V), q, dtype=torch.float32)
+    else:
+        dh0 = None
     dv2 = _empty_like(dv)
     outputs = (dh, dh0, dv2)
     return _call_aclnn(
