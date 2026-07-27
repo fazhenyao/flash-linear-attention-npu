@@ -319,9 +319,10 @@ public:
         const uint32_t gatedQPeak = CHUNK_GDR_BWD_DHU_NUM_2 * static_cast<uint32_t>(chunkSize_) *
                                         CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE +
                                     dqkBufByte + dqkCastBufByte + gBrcbBufByte;
-        const uint32_t dhPeak = CHUNK_GDR_BWD_DHU_NUM_2 * dhCastBufByte +
-                                halfK * static_cast<uint32_t>(V_) * CHUNK_GDR_BWD_DHU_HALF_DTYPE_SIZE;
-        const uint32_t tBufByte = std::max(dhPeak, std::max(dvPeak, gatedQPeak));
+        const uint32_t dhScratch = dhCastBufByte +
+                                   halfK * static_cast<uint32_t>(V_) * CHUNK_GDR_BWD_DHU_HALF_DTYPE_SIZE;
+        const uint32_t scratchPeak = std::max(dhScratch, std::max(dvPeak, gatedQPeak));
+        const uint32_t tBufByte = scratchPeak + dhCastBufByte;
 
         OP_CHECK_IF(tBufByte > ctx_.ubSize,
                     OP_LOGE(ctx_.nodeName, "K/V is too large, K should less than 128 and V should less than 256."),
@@ -349,11 +350,8 @@ public:
             (bdvWs + qWs) * CHUNK_GDR_BWD_DHU_HALF_DTYPE_SIZE;
         const uint64_t wDv2WsOffset =
             qDoWsOffset + qDoWs * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE;
-        const uint64_t bdhWsOffset =
-            wDv2WsOffset + wDv2Ws * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE;
-        const uint64_t bdhWs = K_ * V_ * usedCoreNum;
         const size_t usrWsSize = static_cast<size_t>(
-            bdhWsOffset + bdhWs * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE);
+            wDv2WsOffset + wDv2Ws * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE);
 
         workspaceSize_ = usrWsSize + ctx_.sysWorkspaceSize;
         tiling_.bdvWs = bdvWs;
@@ -362,8 +360,8 @@ public:
         tiling_.qDoWs = qDoWs;
         tiling_.qDoWsOffset = qDoWsOffset;
         tiling_.wDv2WsOffset = wDv2WsOffset;
-        tiling_.bdhWsOffset = bdhWsOffset;
-        tiling_.bdhWs = bdhWs;
+        tiling_.bdhWsOffset = usrWsSize;
+        tiling_.bdhWs = 0;
         return ge::GRAPH_SUCCESS;
     }
 

@@ -72,7 +72,6 @@ protected:
     GlobalTensor<float> wv2Gm;
     GlobalTensor<float> qdoGm;
     GlobalTensor<DT> gatedQGm;
-    GlobalTensor<float> bdhStateGm;
     
     // calc gated q
     LocalTensor<DT> qLocal; // [BT/2,K]
