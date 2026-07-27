@@ -316,33 +316,39 @@ public:
                         CopyGmToL1B_Bdv copyGmToL1B_Bdv;
                         CopyL0CToGm_Bdv copyL0CToGm_Bdv;
 
-                        PipeBarrier<PIPE_ALL>();
                         // load L1A
                         auto tensorL1A = tla::MakeTensor(l1ATensorBdv, L1A_LAYOUT_BDV, Arch::PositionL1{});
                         auto tensorGmTileA = GetTile(tensorBlockK, tla::MakeCoord(0, 0), tla::MakeShape(curBT, params.K));
                         copyGmToL1A_Bdv(tensorL1A, tensorGmTileA);
-                        PipeBarrier<PIPE_ALL>();
+                        constexpr uint32_t EVENT_BDV_L1A = 2;
+                        constexpr uint32_t EVENT_BDV_L1B = 3;
+                        constexpr uint32_t EVENT_BDV_L0_READY = 1;
+                        constexpr uint32_t EVENT_BDV_L0C = 1;
+                        constexpr uint32_t EVENT_BDV_L0A_FREE = 2;
+                        constexpr uint32_t EVENT_BDV_L0B_FREE = 3;
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1A);
 
                         // copy L1A -> L0A
                         auto layoutAInL0 = tla::MakeLayout<ElementK, LayoutTagL0A_Bdv>(curBT, params.K);
                         auto tensorL0A = tla::MakeTensor(l0ATensorBdv, layoutAInL0, Arch::PositionL0A{});
                         auto tensorTileL1A = GetTile(tensorL1A, tla::MakeCoord(0, 0), tla::MakeShape(curBT, params.K));
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1A);
                         copyL1ToL0A_Bdv(tensorL0A, tensorTileL1A);
-                        PipeBarrier<PIPE_ALL>();
 
                         // load L1B
                         CrossCoreWaitFlag(CROSS_CORE_V2C_BDH);
                         auto tensorL1B = tla::MakeTensor(l1BTensorBdv, L1B_LAYOUT_BDV, Arch::PositionL1{});
                         auto tensorGmTileB = GetTile(tensorBlockDh, tla::MakeCoord(0, 0), tla::MakeShape(params.K, params.V));
                         copyGmToL1B_Bdv(tensorL1B, tensorGmTileB);
-                        PipeBarrier<PIPE_ALL>();
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1B);
 
                         // copy L1B -> L0B
                         auto layoutBInL0 = tla::MakeLayout<ElementDh, LayoutTagL0B_Bdv>(params.K, params.V);
                         auto tensorL0B = tla::MakeTensor(l0BTensorBdv, layoutBInL0, Arch::PositionL0B{});
                         auto tensorTileL1B = GetTile(tensorL1B,  tla::MakeCoord(0, 0), tla::MakeShape(params.K, params.V));
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1B);
                         copyL1ToL0B_Bdv(tensorL0B, tensorTileL1B);
-                        PipeBarrier<PIPE_ALL>();
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_BDV_L0_READY);
 
                         bool initC = true; //k方向没有循环
                         uint8_t unitFlag = 0;
@@ -351,11 +357,17 @@ public:
                         auto tensorTileL0C = GetTile(tensorL0C,
                                                      tla::MakeCoord(0,0),
                                                      tla::MakeShape(curBT, params.V));
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_BDV_L0_READY);
                         tileMmadBdv(tensorTileL0C, tensorL0A, tensorL0B, initC, unitFlag);
-                        
-                        PipeBarrier<PIPE_ALL>();
+                        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_BDV_L0A_FREE);
+                        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_BDV_L0B_FREE);
+                        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_BDV_L0C);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_BDV_L0A_FREE);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_BDV_L0B_FREE);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_BDV_L0C);
                         copyL0CToGm_Bdv(tensorBlockBdv, tensorL0C);
-                        PipeBarrier<PIPE_ALL>();
+                        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_BDV_L0C);
+                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_BDV_L0C);
                         CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_BDV); // 计算完一个chunk的bdv,通知vec可以开始计算对应的dv2
                     } // end chunk k @ dh
                     
