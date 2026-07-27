@@ -151,13 +151,13 @@ __aicore__ inline void GDRVec<DT, GT>::InitGlobalTensor(GM_ADDR q, GM_ADDR dv, G
     }
 
     // workspace
-    // | DT bdv | DT gatedQ | FP32 qDoWs | FP32 wDv2Ws |
+    // | DT bdv | DT gatedQ | DT qDoWs | DT wDv2Ws |
     uint64_t wsOffset = 0;
     this->bdvGm.SetGlobalBuffer((__gm__ DT *)workspace + wsOffset);
     wsOffset += this->bdvWs; 
     this->gatedQGm.SetGlobalBuffer((__gm__ DT *)workspace + wsOffset);
-    this->qdoGm.SetGlobalBuffer((__gm__ float *)((__gm__ uint8_t *)workspace + this->qDoWsOffset));
-    this->wv2Gm.SetGlobalBuffer((__gm__ float *)((__gm__ uint8_t *)workspace + this->wDv2WsOffset));
+    this->qdoGm.SetGlobalBuffer((__gm__ DT *)((__gm__ uint8_t *)workspace + this->qDoWsOffset));
+    this->wv2Gm.SetGlobalBuffer((__gm__ DT *)((__gm__ uint8_t *)workspace + this->wDv2WsOffset));
 }
 
 template <typename DT, typename GT>
@@ -440,7 +440,7 @@ __aicore__ inline void GDRVec<DT, GT>::UpdateDh(const float gLastExp, uint64_t& 
     // dh_updated = dh_i-1 * exp2(bg_last) + term1*scale - term2
     CrossCoreWaitFlag(CROSS_CORE_C2V_TERM1); 
     {
-        CopyIn(this->qdoCastLocal, this->qdoCastLocal, this->qdoGm[qdoOffset_], this->dhBufSize, false);
+        CopyIn(this->qdoCastLocal, this->qdoLocal, this->qdoGm[qdoOffset_], this->dhBufSize);
         if (this->isScale) {
             Axpy(this->bdhCastLocal, this->qdoCastLocal, this->scale, this->dhBufSize);
         } else {
@@ -449,7 +449,7 @@ __aicore__ inline void GDRVec<DT, GT>::UpdateDh(const float gLastExp, uint64_t& 
     }
     CrossCoreWaitFlag(CROSS_CORE_C2V_TERM2);
     {
-        CopyIn(this->wv2CastLocal, this->wv2CastLocal, this->wv2Gm[wV2Offset_], this->dhBufSize, false);
+        CopyIn(this->wv2CastLocal, this->wv2Local, this->wv2Gm[wV2Offset_], this->dhBufSize);
         Axpy(this->bdhCastLocal, this->wv2CastLocal, static_cast<float>(-1.0), this->dhBufSize);
     }
     if (chunkIdx_ == 0) {

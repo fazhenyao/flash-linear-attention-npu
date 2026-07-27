@@ -60,7 +60,7 @@ public:
     using ElementW = DT;
     using ElementDo = DT;
     using ElementDv2 = DT;
-    using ElementBdh = float;
+    using ElementBdh = DT;
     using ElementAccumulator = float;
     using ElementInt = int64_t;
 
@@ -685,8 +685,6 @@ __aicore__ inline void GDRCube<DT, GT>::Process()
     using LayoutTagChunkIndices = layout::RowMajor;
 
     using ElementHalf = half;
-    using ElementFloat = float;
-
     //输入
     LayoutTagK tagK = LayoutTagK::MakeLayout<ElementHalf>(this->T, this->K);
     LayoutTagDh tagDh = LayoutTagDh::MakeLayout<ElementHalf>(this->K, this->V);
@@ -694,7 +692,7 @@ __aicore__ inline void GDRCube<DT, GT>::Process()
 
     LayoutTagGq tagGq = LayoutTagGq::MakeLayout<ElementHalf>(this->K, this->chunkSize);
     LayoutTagDo tagDo = LayoutTagDo::MakeLayout<ElementHalf>(this->T, this->V);
-    LayoutTagBdh tagBdh = LayoutTagBdh::MakeLayout<ElementFloat>(this->K, this->V);
+    LayoutTagBdh tagBdh = LayoutTagBdh::MakeLayout<ElementHalf>(this->K, this->V);
 
     LayoutTagW tagW = LayoutTagW::MakeLayout<ElementHalf>(this->K, this->T);
     LayoutTagDv2 tagDv2 = LayoutTagDv2::MakeLayout<ElementHalf>(this->T, this->V);
@@ -726,9 +724,9 @@ __aicore__ inline void GDRCube<DT, GT>::Process()
     using L0TileShapeBdv = tla::Shape<_128, _256, _128>;
 
     using TileCopyDh1 = 
-            Gemm::Tile::PackedTileCopyTla<ArchTag, DT, LayoutTagGq, DT, LayoutTagDo, float, LayoutTagBdh>;
+            Gemm::Tile::PackedTileCopyTla<ArchTag, DT, LayoutTagGq, DT, LayoutTagDo, DT, LayoutTagBdh>;
     using TileCopyDh2 = 
-            Gemm::Tile::PackedTileCopyTla<ArchTag, DT, LayoutTagW, DT, LayoutTagDv2, float, LayoutTagBdh>;
+            Gemm::Tile::PackedTileCopyTla<ArchTag, DT, LayoutTagW, DT, LayoutTagDv2, DT, LayoutTagBdh>;
     using L1TileShapeDh = tla::Shape<_128, _256, _128>; // K,V, BT
     using L0TileShapeDh = tla::Shape<_128, _256, _128>;
     // kernel level

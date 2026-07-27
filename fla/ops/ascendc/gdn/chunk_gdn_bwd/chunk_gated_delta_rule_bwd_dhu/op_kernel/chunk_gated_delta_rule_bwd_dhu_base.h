@@ -69,8 +69,8 @@ protected:
     GlobalTensor<float> dh0Gm;
     // inprocess workspace gm
     GlobalTensor<DT> bdvGm;
-    GlobalTensor<float> wv2Gm;
-    GlobalTensor<float> qdoGm;
+    GlobalTensor<DT> wv2Gm;
+    GlobalTensor<DT> qdoGm;
     GlobalTensor<DT> gatedQGm;
     
     // calc gated q

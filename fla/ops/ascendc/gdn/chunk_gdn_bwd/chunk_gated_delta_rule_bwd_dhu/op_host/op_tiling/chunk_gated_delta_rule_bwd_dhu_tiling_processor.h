@@ -349,9 +349,9 @@ public:
         const uint64_t qDoWsOffset =
             (bdvWs + qWs) * CHUNK_GDR_BWD_DHU_HALF_DTYPE_SIZE;
         const uint64_t wDv2WsOffset =
-            qDoWsOffset + qDoWs * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE;
+            qDoWsOffset + qDoWs * CHUNK_GDR_BWD_DHU_HALF_DTYPE_SIZE;
         const size_t usrWsSize = static_cast<size_t>(
-            wDv2WsOffset + wDv2Ws * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE);
+            wDv2WsOffset + wDv2Ws * CHUNK_GDR_BWD_DHU_HALF_DTYPE_SIZE);
 
         workspaceSize_ = usrWsSize + ctx_.sysWorkspaceSize;
         tiling_.bdvWs = bdvWs;
