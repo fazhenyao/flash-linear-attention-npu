@@ -484,9 +484,11 @@ public:
                         // load L1A
                         CrossCoreWaitFlag(CROSS_CORE_V2C_GQ); // vec计算完一个chunk的gatedQ,通知cube可以开始计算对应的dh term1
                         copyGmToL1A_Dh1(tensorL1A1, tensorGmTileA1);
-                        PipeBarrier<PIPE_ALL>();
+                        constexpr uint32_t EVENT_TERM1_L1A_READY = 0;
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_TERM1_L1A_READY);
 
                         // copy L1A -> L0A
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_TERM1_L1A_READY);
                         copyL1ToL0A_Dh1(tensorL0A1, tensorTileL1A1);
                         PipeBarrier<PIPE_ALL>();
 
