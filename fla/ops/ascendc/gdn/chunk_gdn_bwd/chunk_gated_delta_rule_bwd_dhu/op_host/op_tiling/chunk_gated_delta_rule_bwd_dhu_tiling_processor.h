@@ -204,6 +204,7 @@ public:
         tiling_.T = T_;
         tiling_.K = K_;
         tiling_.V = V_;
+        tiling_.hasG = ctx_.hasG ? 1 : 0;
         tiling_.hasGk = ctx_.hasGk ? 1 : 0;
         tiling_.hasH0 = ctx_.hasH0 ? 1 : 0;
         tiling_.hasDht = ctx_.hasDht ? 1 : 0;
@@ -247,6 +248,13 @@ public:
                     OP_LOGE(ctx_.nodeName, "B must be 1 when sequence is variable len, but got %lu.", B_),
                     return ge::GRAPH_FAILED);
         const uint64_t stateBatch = isVariableLen_ ? tiling_.seqNum : B_;
+        if (ctx_.hasG) {
+            const gert::Shape gShape = ctx_.gShape->GetStorageShape();
+            OP_CHECK_IF(gShape.GetDim(0) != static_cast<int64_t>(B_) ||
+                            gShape.GetDim(1) != static_cast<int64_t>(Hv_) ||
+                            gShape.GetDim(2) != static_cast<int64_t>(T_),
+                        OP_LOGE(ctx_.nodeName, "g must be [B,Hv,T]."), return ge::GRAPH_FAILED);
+        }
         if (ctx_.hasGk) {
             const gert::Shape gkShape = ctx_.gkShape->GetStorageShape();
             OP_CHECK_IF(gkShape.GetDim(0) != static_cast<int64_t>(B_) ||
@@ -276,23 +284,19 @@ public:
 
     ge::graphStatus CheckInputDtype()
     {
-        if (!ctx_.hasG) {
-            OP_LOGE(ctx_.nodeName, "Input g is required for chunk_gated_delta_rule_bwd_dhu kernel.");
-            return ge::GRAPH_FAILED;
-        }
         const ge::DataType qDtype = ctx_.qDtype;
-        const ge::DataType gDtype = ctx_.gDtype;
-        if (gDtype != qDtype && gDtype != ge::DT_FLOAT) {
-            OP_LOGE(ctx_.nodeName, "gDtype must be DT_FLOAT or as same as qDtype");
+        const ge::DataType gateDtype = ctx_.hasG ? ctx_.gDtype : (ctx_.hasGk ? ctx_.gkDtype : qDtype);
+        if (gateDtype != qDtype && gateDtype != ge::DT_FLOAT) {
+            OP_LOGE(ctx_.nodeName, "g/gk dtype must be float32 or the same as q dtype.");
             return ge::GRAPH_FAILED;
         }
-        if (gDtype == ge::DT_FLOAT) {
+        if (gateDtype == ge::DT_FLOAT) {
             tilingKey_ = GDN::CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY_G_FP32;
         } else {
             tilingKey_ = GDN::CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY;
         }
-        if (ctx_.hasGk && ctx_.gkDtype != gDtype) {
-            OP_LOGE(ctx_.nodeName, "gk must have the same dtype as g.");
+        if (ctx_.hasG && ctx_.hasGk && ctx_.gkDtype != ctx_.gDtype) {
+            OP_LOGE(ctx_.nodeName, "gk must have the same dtype as g when both are provided.");
             return ge::GRAPH_FAILED;
         }
         if (ctx_.hasDht && ctx_.dhtDtype != ge::DT_FLOAT) {

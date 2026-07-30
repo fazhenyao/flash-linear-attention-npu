@@ -124,6 +124,7 @@ protected:
     uint64_t bdhWs = 0;
     uint64_t isVarLen = 0;
     uint64_t isScale = 0;
+    uint64_t hasG = 0;
     uint64_t hasGk = 0;
     uint64_t hasH0 = 0;
     uint64_t hasDht = 0;
@@ -169,6 +170,7 @@ __aicore__ inline void GDRBase<DT, GT>::InitTilingData(const ChunkGatedDeltaRule
     this->bdhWs = tilingData.bdhWs;
     this->isVarLen = tilingData.isVarLen;
     this->isScale = tilingData.isScale;
+    this->hasG = tilingData.hasG;
     this->hasGk = tilingData.hasGk;
     this->hasH0 = tilingData.hasH0;
     this->hasDht = tilingData.hasDht;

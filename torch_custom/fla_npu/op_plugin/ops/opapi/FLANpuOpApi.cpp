@@ -219,6 +219,7 @@ bool ResolveChunkLocalCumsumOutputDtype(
     int64_t Hv = dv_size[1];
     int64_t V = dv_size[3];
     int64_t chunk_num = (T + chunk_size -1) / chunk_size;
+    int64_t state_batch = cu_seqlens.has_value() ? static_cast<int64_t>(cu_seqlens.value().size()) - 1 : B;
 
     TORCH_CHECK(
         k_size[0] == B && k_size[1] == Hk && k_size[2] == T && k_size[3] == K,
@@ -249,7 +250,7 @@ bool ResolveChunkLocalCumsumOutputDtype(
     at::Tensor dh = at::empty({B, Hv, chunk_num, K, V}, q.options());
     at::Tensor dh0;
     if (h0.has_value()) {
-        dh0 = at::empty({B, Hv, chunk_num, K, V}, q.options());
+        dh0 = at::empty({state_batch, Hv, K, V}, q.options().dtype(at::kFloat));
     } else {
         dh0 = at::Tensor();
     }
@@ -265,17 +266,26 @@ bool ResolveChunkLocalCumsumOutputDtype(
             g_.dim() == 3 && g_.size(0) == B && g_.size(1) == Hv && g_.size(2) == T,
             "npu_chunk_gated_delta_rule_bwd_dhu: g must be [B,Hv,T]; g=", g_.sizes());
     }
+    if (gK_.defined()) {
+        TORCH_CHECK(
+            gK_.dim() == 4 && gK_.size(0) == B && gK_.size(1) == Hv && gK_.size(2) == T && gK_.size(3) == K,
+            "npu_chunk_gated_delta_rule_bwd_dhu: gK must be [B,Hv,T,K]; gK=", gK_.sizes());
+        if (g_.defined()) {
+            TORCH_CHECK(
+                gK_.scalar_type() == g_.scalar_type(),
+                "npu_chunk_gated_delta_rule_bwd_dhu: gK must have the same dtype as g when both are provided; g=",
+                g_.scalar_type(), " gK=", gK_.scalar_type());
+        }
+    }
     if (h0_.defined()) {
         TORCH_CHECK(
-            h0_.dim() == 5 && h0_.size(0) == B && h0_.size(1) == Hv && h0_.size(2) == chunk_num,
-            "npu_chunk_gated_delta_rule_bwd_dhu: h0 must be [B,Hv,chunk_num,K,V]; h0=", h0_.sizes(),
-            " chunk_num=", chunk_num);
+            h0_.dim() == 4 && h0_.size(0) == state_batch && h0_.size(1) == Hv && h0_.size(2) == K && h0_.size(3) == V,
+            "npu_chunk_gated_delta_rule_bwd_dhu: h0 must be [N,Hv,K,V]; h0=", h0_.sizes());
     }
     if (dht_.defined()) {
         TORCH_CHECK(
-            dht_.dim() == 5 && dht_.size(0) == B && dht_.size(1) == Hv && dht_.size(2) == chunk_num,
-            "npu_chunk_gated_delta_rule_bwd_dhu: dht must be [B,Hv,chunk_num,K,V]; dht=", dht_.sizes(),
-            " chunk_num=", chunk_num);
+            dht_.dim() == 4 && dht_.size(0) == state_batch && dht_.size(1) == Hv && dht_.size(2) == K && dht_.size(3) == V,
+            "npu_chunk_gated_delta_rule_bwd_dhu: dht must be [N,Hv,K,V]; dht=", dht_.sizes());
     }
 
     // 调用ACLNN算子

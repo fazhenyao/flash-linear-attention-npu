@@ -64,6 +64,7 @@ static void ChunkGatedDeltaRuleBwdDhuTilingDataPrint(gert::TilingContext *contex
     OP_LOGD(nodeName, "bdhWs is %lu FP32 elements.", tiling.bdhWs);
     OP_LOGD(nodeName, "isVarLen is %lu.", tiling.isVarLen);
     OP_LOGD(nodeName, "isScale is %lu.", tiling.isScale);
+    OP_LOGD(nodeName, "hasG is %lu.", tiling.hasG);
     OP_LOGD(nodeName, "hasGk is %lu.", tiling.hasGk);
     OP_LOGD(nodeName, "hasH0 is %lu.", tiling.hasH0);
     OP_LOGD(nodeName, "hasDht is %lu.", tiling.hasDht);

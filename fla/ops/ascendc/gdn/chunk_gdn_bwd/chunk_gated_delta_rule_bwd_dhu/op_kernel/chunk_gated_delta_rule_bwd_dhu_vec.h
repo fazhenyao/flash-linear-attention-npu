@@ -351,9 +351,20 @@ template <typename DT, typename GT>
 __aicore__ inline void GDRVec<DT, GT>::CalcGatedQ(float& gLast, float& gLastExp, const bool isLastChunk)
 {
     if (this->curCalcBT == 0) {
-        if (chunkIdx_ != 0) {
+        if (chunkIdx_ != 0 || this->hasH0) {
             CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_GQ);
         }
+        return;
+    }
+    if (!this->hasG) {
+        gLast = 0.0f;
+        gLastExp = 1.0f;
+        if (chunkIdx_ == 0 && !this->hasH0) {
+            return;
+        }
+        CopyIn(this->qCastLocal, this->qLocal, this->qGm[gmOffsetK_ + bos_ * this->K], this->curCalcTK);
+        CopyOut(this->qLocal, this->qCastLocal, this->gatedQGm[gatedQOffset_], this->curCalcTK);
+        CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_GQ);
         return;
     }
     // GetValue emits the required vector/scalar dependency without expanding the gate state to a full vector.
@@ -412,16 +423,17 @@ __aicore__ inline void GDRVec<DT, GT>::CalcDv2(const float gLast, uint64_t& curG
         CopyOut(this->vInLocal, this->dvCastLocal, this->dv2Gm[curGmOffsetV], this->curCalcTV, false);
     } else {
         CopyIn(this->dvCastLocal, this->vInLocal, this->dvGm[curGmOffsetV], this->dvBufSize);
-        Muls(this->gCastLocal, this->gCastLocal, static_cast<float>(-1.0), this->halfBT);
-        Adds(this->gCastLocal, this->gCastLocal, gLast, this->halfBT);
-        Muls(this->gCastLocal, this->gCastLocal, LN2, this->halfBT);
-        Exp(this->gCastLocal, this->gCastLocal, this->halfBT);
-        uint8_t repeatTimes = Ceil(this->halfBT, FP32_PER_BLOCK); // halfBT is 32 or 64
-        Brcb(this->gBrcbLocal, this->gCastLocal, repeatTimes, {1,FP32_PER_BLOCK});
-        // halfBT * 32
         CrossCoreWaitFlag(CROSS_CORE_C2V_BDV); // cube计算完一个chunk的bdv,vec开始计算对应的dv2
         CopyIn(this->bdvCastLocal, this->vInLocal, this->bdvGm[bdvOffset_], this->dvBufSize);
-        BlockMul(this->bdvCastLocal, this->gBrcbLocal, this->bdvCastLocal, this->halfBT, this->V);
+        if (this->hasG) {
+            Muls(this->gCastLocal, this->gCastLocal, static_cast<float>(-1.0), this->halfBT);
+            Adds(this->gCastLocal, this->gCastLocal, gLast, this->halfBT);
+            Muls(this->gCastLocal, this->gCastLocal, LN2, this->halfBT);
+            Exp(this->gCastLocal, this->gCastLocal, this->halfBT);
+            uint8_t repeatTimes = Ceil(this->halfBT, FP32_PER_BLOCK); // halfBT is 32 or 64
+            Brcb(this->gBrcbLocal, this->gCastLocal, repeatTimes, {1,FP32_PER_BLOCK});
+            BlockMul(this->bdvCastLocal, this->gBrcbLocal, this->bdvCastLocal, this->halfBT, this->V);
+        }
         Add(this->bdvCastLocal, this->bdvCastLocal, this->dvCastLocal, this->dvBufSize);
         CopyOut(this->vInLocal, this->bdvCastLocal, this->dv2Gm[curGmOffsetV], this->dvBufSize);
     }
@@ -432,7 +444,9 @@ __aicore__ inline void GDRVec<DT, GT>::UpdateDh(const float gLastExp, uint64_t& 
                                                 const bool isLastChunk)
 {
     curGmOffsetH = gmOffsetH_ + chunkIdx_ * dhBlockSize_;
-    Muls(this->bdhCastLocal, this->bdhCastLocal, gLastExp, this->dhBufSize);
+    if (this->hasG) {
+        Muls(this->bdhCastLocal, this->bdhCastLocal, gLastExp, this->dhBufSize);
+    }
     ApplyGk(this->bdhCastLocal);
     if (chunkIdx_ == 0 && !this->hasH0) {
         return;

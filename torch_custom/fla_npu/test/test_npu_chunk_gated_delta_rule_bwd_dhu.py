@@ -10,6 +10,7 @@
 
 import torch
 import os
+import math
 # import custom_ops
 from fla_npu.ops import ascendc as ascendc_ops
 
@@ -20,6 +21,70 @@ os.environ['PARALLEL_COMPILE'] = '0'
 torch.npu.config.allow_internal_format = False
 torch.npu.set_compile_mode(jit_compile=False)
 torch.npu.set_device(int(os.environ.get("TEST_DEVICE_ID", 0)))
+
+
+def _reference(q, k, w, do, dv, *, g=None, gk=None, h0=None, dht=None, scale=1.0, chunk_size=64):
+    B, Hk, T, K = q.shape
+    Hv, V = do.shape[1], do.shape[-1]
+    NT = (T + chunk_size - 1) // chunk_size
+    hq = torch.arange(Hv) // (Hv // Hk)
+    b_dh = dht.float().clone() if dht is not None else torch.zeros(B, Hv, K, V)
+    dh = torch.empty(B, Hv, NT, K, V)
+    dv2 = torch.empty_like(dv)
+    for chunk_idx in range(NT - 1, -1, -1):
+        start = chunk_idx * chunk_size
+        end = min(start + chunk_size, T)
+        last = end - 1
+        dh[:, :, chunk_idx] = b_dh
+        q_chunk = q[:, :, start:end].index_select(1, hq).float()
+        k_chunk = k[:, :, start:end].index_select(1, hq).float()
+        w_chunk = w[:, :, start:end].float()
+        do_chunk = do[:, :, start:end].float()
+        b_dv = torch.matmul(k_chunk, b_dh)
+        if g is not None:
+            g_chunk = g[:, :, start:end].float()
+            g_last = g[:, :, last].float()
+            b_dv *= torch.exp2(g_last[:, :, None, None] - g_chunk[:, :, :, None])
+        b_dv += dv[:, :, start:end].float()
+        dv2[:, :, start:end] = b_dv.to(dv.dtype)
+        if g is not None:
+            b_dh *= torch.exp2(g_last[:, :, None, None])
+            q_chunk *= torch.exp2(g_chunk[:, :, :, None])
+        if gk is not None:
+            b_dh *= torch.exp2(gk[:, :, last].float())[:, :, :, None]
+        b_dh += torch.matmul(q_chunk.transpose(-1, -2), do_chunk) * scale
+        b_dh -= torch.matmul(w_chunk.transpose(-1, -2), b_dv)
+    return dh, b_dh if h0 is not None else None, dv2
+
+
+def test_gate_modes():
+    torch.manual_seed(1)
+    B, Hk, Hv, T, K, V = 1, 1, 2, 128, 128, 64
+    dtype = torch.bfloat16
+    scale = 1.0 / math.sqrt(K)
+    q = torch.randn(B, Hk, T, K, dtype=dtype) * 0.1
+    k = torch.randn_like(q) * 0.1
+    w = torch.randn(B, Hv, T, K, dtype=dtype) * 0.1
+    do = torch.randn(B, Hv, T, V, dtype=dtype) * 0.1
+    dv = torch.randn_like(do) * 0.1
+    scalar_g = torch.cumsum(-torch.rand(B, Hv, T, dtype=torch.float32) * 0.02, dim=-1)
+    key_g = torch.cumsum(-torch.rand(B, Hv, T, K, dtype=torch.float32) * 0.02, dim=-2)
+
+    cases = [
+        ("gdn", q, k, scalar_g, None),
+        ("kda", q * 0.75, k * 0.5, None, key_g),
+        ("ungated", q, k, None, None),
+    ]
+    for name, q_in, k_in, g, gk in cases:
+        dh_ref, _, dv2_ref = _reference(q_in, k_in, w, do, dv, g=g, gk=gk, scale=scale)
+        dh, _, dv2 = ascendc_ops.npu_chunk_gated_delta_rule_bwd_dhu(
+            q_in.npu(), k_in.npu(), w.npu(), do.npu(), dv.npu(), scale, 64,
+            g=None if g is None else g.npu(), gK=None if gk is None else gk.npu(),
+        )
+        torch.npu.synchronize()
+        torch.testing.assert_close(dh.cpu().float(), dh_ref, rtol=0.03, atol=0.03, msg=lambda msg: f"{name} dh: {msg}")
+        torch.testing.assert_close(dv2.cpu().float(), dv2_ref.float(), rtol=0.03, atol=0.03,
+                                   msg=lambda msg: f"{name} dv2: {msg}")
 
 
 def prepare_chunk_indices_original(cu_seqlens, chunk_size=64):

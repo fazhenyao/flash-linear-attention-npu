@@ -47,6 +47,7 @@ struct ChunkGatedDeltaRuleBwdDhuTilingData {
     uint64_t bdhWs;
     uint64_t isVarLen;
     uint64_t isScale;
+    uint64_t hasG;
     uint64_t hasGk;
     uint64_t hasH0;
     uint64_t hasDht;
