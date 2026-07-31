@@ -264,6 +264,13 @@ public:
         l0BTensorDh = resource.l0BBuf.template GetBufferByByte<ElementDh>(0);
 
         l0CTensor = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(0);
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+        // A5 has enough L0C capacity to let TERM2 MMAD start while FIX drains TERM1.
+        l0CTensorTerm2 = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(
+            L1_TILE_M_DH * L1_TILE_N_DH * sizeof(ElementAccumulator));
+#else
+        l0CTensorTerm2 = l0CTensor;
+#endif
         {
             // 每个核完成一个 batch 内一个 q/k 头 hq、一条序列上的所有 chunk；组内各 value 头 h 串行处理（GVA 方案 A）
             // 性能说明：当前循环顺序为 for(h) for(chunkIdx)，同一 (hq,chunkIdx) 上 k 的 GM 片相同，但 bdv=k@dh 会对每个 h 重新 copyGmToL1A(k)；
@@ -316,33 +323,39 @@ public:
                         CopyGmToL1B_Bdv copyGmToL1B_Bdv;
                         CopyL0CToGm_Bdv copyL0CToGm_Bdv;
 
-                        PipeBarrier<PIPE_ALL>();
                         // load L1A
                         auto tensorL1A = tla::MakeTensor(l1ATensorBdv, L1A_LAYOUT_BDV, Arch::PositionL1{});
                         auto tensorGmTileA = GetTile(tensorBlockK, tla::MakeCoord(0, 0), tla::MakeShape(curBT, params.K));
                         copyGmToL1A_Bdv(tensorL1A, tensorGmTileA);
-                        PipeBarrier<PIPE_ALL>();
+                        constexpr uint32_t EVENT_BDV_L1A = 2;
+                        constexpr uint32_t EVENT_BDV_L1B = 3;
+                        constexpr uint32_t EVENT_BDV_L0_READY = 1;
+                        constexpr uint32_t EVENT_BDV_L0C = 1;
+                        constexpr uint32_t EVENT_BDV_L0A_FREE = 2;
+                        constexpr uint32_t EVENT_BDV_L0B_FREE = 3;
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1A);
 
                         // copy L1A -> L0A
                         auto layoutAInL0 = tla::MakeLayout<ElementK, LayoutTagL0A_Bdv>(curBT, params.K);
                         auto tensorL0A = tla::MakeTensor(l0ATensorBdv, layoutAInL0, Arch::PositionL0A{});
                         auto tensorTileL1A = GetTile(tensorL1A, tla::MakeCoord(0, 0), tla::MakeShape(curBT, params.K));
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1A);
                         copyL1ToL0A_Bdv(tensorL0A, tensorTileL1A);
-                        PipeBarrier<PIPE_ALL>();
 
                         // load L1B
                         CrossCoreWaitFlag(CROSS_CORE_V2C_BDH);
                         auto tensorL1B = tla::MakeTensor(l1BTensorBdv, L1B_LAYOUT_BDV, Arch::PositionL1{});
                         auto tensorGmTileB = GetTile(tensorBlockDh, tla::MakeCoord(0, 0), tla::MakeShape(params.K, params.V));
                         copyGmToL1B_Bdv(tensorL1B, tensorGmTileB);
-                        PipeBarrier<PIPE_ALL>();
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1B);
 
                         // copy L1B -> L0B
                         auto layoutBInL0 = tla::MakeLayout<ElementDh, LayoutTagL0B_Bdv>(params.K, params.V);
                         auto tensorL0B = tla::MakeTensor(l0BTensorBdv, layoutBInL0, Arch::PositionL0B{});
                         auto tensorTileL1B = GetTile(tensorL1B,  tla::MakeCoord(0, 0), tla::MakeShape(params.K, params.V));
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1B);
                         copyL1ToL0B_Bdv(tensorL0B, tensorTileL1B);
-                        PipeBarrier<PIPE_ALL>();
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_BDV_L0_READY);
 
                         bool initC = true; //k方向没有循环
                         uint8_t unitFlag = 0;
@@ -351,11 +364,17 @@ public:
                         auto tensorTileL0C = GetTile(tensorL0C,
                                                      tla::MakeCoord(0,0),
                                                      tla::MakeShape(curBT, params.V));
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_BDV_L0_READY);
                         tileMmadBdv(tensorTileL0C, tensorL0A, tensorL0B, initC, unitFlag);
-                        
-                        PipeBarrier<PIPE_ALL>();
+                        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_BDV_L0A_FREE);
+                        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_BDV_L0B_FREE);
+                        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_BDV_L0C);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_BDV_L0A_FREE);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_BDV_L0B_FREE);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_BDV_L0C);
                         copyL0CToGm_Bdv(tensorBlockBdv, tensorL0C);
-                        PipeBarrier<PIPE_ALL>();
+                        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_BDV_L0C);
+                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_BDV_L0C);
                         CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_BDV); // 计算完一个chunk的bdv,通知vec可以开始计算对应的dv2
                     } // end chunk k @ dh
                     
@@ -458,7 +477,7 @@ public:
                         auto tensorTileL1B2 = GetTile(tensorL1B2,  tla::MakeCoord(0, 0), tla::MakeShape(curBT, params.V));
                         
                         auto layoutInL0C2 = tla::MakeLayoutL0C(params.K, params.V);
-                        auto tensorL0C2 = tla::MakeTensor(l0CTensor, layoutInL0C2, Arch::PositionL0C{});
+                        auto tensorL0C2 = tla::MakeTensor(l0CTensorTerm2, layoutInL0C2, Arch::PositionL0C{});
                         auto tensorTileL0C2 = GetTile(tensorL0C2,
                                                     tla::MakeCoord(0,0),
                                                     tla::MakeShape(params.K, params.V));                        
@@ -494,10 +513,11 @@ public:
 
                         constexpr uint32_t EVENT_TERM_L1B = 0;
                         constexpr uint32_t EVENT_TERM_L0B = 0;
-                        constexpr uint32_t EVENT_TERM_L0C = 0;
+                        constexpr uint32_t EVENT_TERM1_L0C = 0;
+                        constexpr uint32_t EVENT_TERM2_L0C = 1;
                         tileMmadDh1(tensorTileL0C1, tensorL0A1, tensorL0B1, initC, unitFlag);
                         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_TERM_L0B);
-                        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM_L0C);
+                        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM1_L0C);
 
                         // Prefetch dv2 while term1 is running; the two operands use independent L1 buffers.
                         CrossCoreWaitFlag(CROSS_CORE_V2C_DV2);
@@ -510,20 +530,20 @@ public:
                         copyL1ToL0B_Dh2(tensorL0B2, tensorTileL1B2);
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_TERM_L0B);
 
-                        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM_L0C);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM1_L0C);
                         copyL0CToGm_Dh1(tensorBlockDh1, tensorL0C1, unitFlag);
-                        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM_L0C);
-                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM_L0C);
-                        CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_TERM1);
+                        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM1_L0C);
 
                         // w @ dv2 -> bdh_term2
                         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_TERM_L0B);
                         tileMmadDh2(tensorTileL0C2, tensorL0A2, tensorL0B2, initC, unitFlag);
-                        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM_L0C);
-                        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM_L0C);
+                        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM2_L0C);
+                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM1_L0C);
+                        CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_TERM1);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM2_L0C);
                         copyL0CToGm_Dh2(tensorBlockDh2, tensorL0C2, unitFlag);
-                        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM_L0C);
-                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM_L0C);
+                        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM2_L0C);
+                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM2_L0C);
                         CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_TERM2);
                     }
                 }
@@ -593,6 +613,7 @@ private:
     AscendC::LocalTensor<DT> l0ATensorDh2;
     AscendC::LocalTensor<DT> l0BTensorDh;
     AscendC::LocalTensor<ElementAccumulator> l0CTensor;
+    AscendC::LocalTensor<ElementAccumulator> l0CTensorTerm2;
 
     int32_t l1AEventId = 0;
     int32_t l1BEventId = 1;
