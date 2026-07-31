@@ -30,6 +30,7 @@
 #include "catlass/gemm/helper.hpp"
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/gemm/tile/tile_mmad.hpp"
+#include "kernel_utils/tile/copy_l0c_to_ub.hpp"
 #include "tla/layout.hpp"
 #include "tla/tensor.hpp"
 
@@ -271,6 +272,11 @@ public:
 #else
         l0CTensorTerm2 = l0CTensor;
 #endif
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+        // This byte offset matches qdoLocal/wv2Local on both AIV sub-blocks.
+        const uint64_t directTermUbOffset = params.K / 2 * params.V * sizeof(float);
+        directTermUb = resource.ubBuf.template GetBufferByByte<ElementBdh>(directTermUbOffset);
+#endif
         {
             // 每个核完成一个 batch 内一个 q/k 头 hq、一条序列上的所有 chunk；组内各 value 头 h 串行处理（GVA 方案 A）
             // 性能说明：当前循环顺序为 for(h) for(chunkIdx)，同一 (hq,chunkIdx) 上 k 的 GM 片相同，但 bdv=k@dh 会对每个 h 重新 copyGmToL1A(k)；
@@ -422,7 +428,13 @@ public:
                         using CopyGmToL1A_Dh1 = typename TileCopyDh1::template CopyGmToL1A<decltype(tensorBlockGq)>;
                         using CopyGmToL1B_Dh1 = typename TileCopyDh1::template CopyGmToL1B<decltype(tensorBlockDo)>;
 #if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
-                        using CopyL0CToGm_Dh1 = typename TileCopyDh1::template CopyL0CToDst<decltype(tensorBlockDh1)>;
+                        auto directTermLayout = tla::MakeLayout<ElementBdh, layout::RowMajor>(params.K, params.V);
+                        auto directTermTensor = tla::MakeTensor(directTermUb, directTermLayout, Arch::PositionUB{});
+                        auto directTermBlock = GetTile(directTermTensor, tla::MakeCoord(0, 0),
+                                                       tla::MakeShape(params.K, params.V));
+                        using CopyL0CToGm_Dh1 = Common::Tile::CopyL0CToUBTla<
+                            ArchTag, typename TileCopyDh1::TensorL0C, decltype(directTermBlock),
+                            Gemm::Tile::CopyL0CToUBMode::NO_SPLIT>;
 #else
                         using CopyL0CToGm_Dh1 = typename TileCopyDh1::template CopyL0CToGm<decltype(tensorBlockDh1)>;
 #endif
@@ -433,7 +445,7 @@ public:
                         using CopyGmToL1A_Dh2 = typename TileCopyDh2::template CopyGmToL1A<decltype(tensorBlockW)>;
                         using CopyGmToL1B_Dh2 = typename TileCopyDh2::template CopyGmToL1B<decltype(tensorBlockDv2)>;
 #if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
-                        using CopyL0CToGm_Dh2 = typename TileCopyDh2::template CopyL0CToDst<decltype(tensorBlockDh2)>;
+                        using CopyL0CToGm_Dh2 = CopyL0CToGm_Dh1;
 #else
                         using CopyL0CToGm_Dh2 = typename TileCopyDh2::template CopyL0CToGm<decltype(tensorBlockDh2)>;
 #endif
@@ -531,7 +543,13 @@ public:
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_TERM_L0B);
 
                         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM1_L0C);
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_TERM);
+                        CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_TERM + A5_FLAG_ID_MAX);
+                        copyL0CToGm_Dh1(directTermBlock, tensorL0C1, params.K / 2, 0, 2, unitFlag);
+#else
                         copyL0CToGm_Dh1(tensorBlockDh1, tensorL0C1, unitFlag);
+#endif
                         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM1_L0C);
 
                         // w @ dv2 -> bdh_term2
@@ -539,17 +557,38 @@ public:
                         tileMmadDh2(tensorTileL0C2, tensorL0A2, tensorL0B2, initC, unitFlag);
                         AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM2_L0C);
                         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM1_L0C);
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        CrossCoreSetFlag<0x4, PIPE_FIX>(A5_SYNC_AIC_AIV_TERM);
+                        CrossCoreSetFlag<0x4, PIPE_FIX>(A5_SYNC_AIC_AIV_TERM + A5_FLAG_ID_MAX);
+#else
                         CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_TERM1);
+#endif
                         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM2_L0C);
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_TERM);
+                        CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_TERM + A5_FLAG_ID_MAX);
+                        copyL0CToGm_Dh2(directTermBlock, tensorL0C2, params.K / 2, 0, 2, unitFlag);
+#else
                         copyL0CToGm_Dh2(tensorBlockDh2, tensorL0C2, unitFlag);
+#endif
                         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM2_L0C);
                         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_TERM2_L0C);
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        CrossCoreSetFlag<0x4, PIPE_FIX>(A5_SYNC_AIC_AIV_TERM);
+                        CrossCoreSetFlag<0x4, PIPE_FIX>(A5_SYNC_AIC_AIV_TERM + A5_FLAG_ID_MAX);
+#else
                         CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_TERM2);
+#endif
                     }
                 }
                 }
             }
         }
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+        // Consume the final pair of free tokens so no 0x4 event escapes the kernel.
+        CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_TERM);
+        CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_TERM + A5_FLAG_ID_MAX);
+#endif
         return;
     }
     
@@ -614,6 +653,7 @@ private:
     AscendC::LocalTensor<DT> l0BTensorDh;
     AscendC::LocalTensor<ElementAccumulator> l0CTensor;
     AscendC::LocalTensor<ElementAccumulator> l0CTensorTerm2;
+    AscendC::LocalTensor<ElementBdh> directTermUb;
 
     int32_t l1AEventId = 0;
     int32_t l1BEventId = 1;

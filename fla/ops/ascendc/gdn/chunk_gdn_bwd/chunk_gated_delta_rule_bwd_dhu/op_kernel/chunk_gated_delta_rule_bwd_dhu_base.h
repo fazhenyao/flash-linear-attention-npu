@@ -42,6 +42,12 @@ constexpr uint8_t CROSS_CORE_C2V_TERM1 = 3;  // cube算完dh_term1,通知vec搬�
 constexpr uint8_t CROSS_CORE_C2V_TERM2 = 4;  // cube算完dh_term2,通知vec搬入dh_term1
 constexpr uint8_t CROSS_CORE_V2C_BDH = 5;  // vec更新完dh,通知cube進行下個chunk的bdv計算
 
+// A5 FixPipe-to-UB uses the mature 0x4 two-AIV handshake. Each AIV sees the
+// same local flag id, separated by FLAG_ID_MAX in the AIC flag namespace.
+constexpr uint64_t A5_FLAG_ID_MAX = 16;
+constexpr uint64_t A5_SYNC_AIV_AIC_TERM = 6;
+constexpr uint64_t A5_SYNC_AIC_AIV_TERM = 7;
+
 
 template <typename DT, typename GT>
 class GDRBase {

@@ -23,6 +23,54 @@ namespace ChunkGDRBwdDhu {
 
 constexpr float LN2 = 0.6931471805599453f;
 
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+using namespace AscendC::MicroAPI;
+
+constexpr CastTrait BWD_DHU_B16_TO_F32 = {
+    RegLayout::ZERO, SatMode::UNKNOWN, MaskMergeMode::ZEROING, RoundMode::UNKNOWN};
+
+template <typename T>
+static __simd_vf__ inline void UpdateDhTermVf(__ubuf__ float* bdhAddr, __ubuf__ T* termAddr,
+                                              float alpha, uint32_t count)
+{
+    constexpr uint16_t ELEMS_PER_REG = AscendC::VECTOR_REG_WIDTH / sizeof(float);
+    const uint16_t loopCount = static_cast<uint16_t>((count + ELEMS_PER_REG - 1) / ELEMS_PER_REG);
+    RegTensor<float> bdh0;
+    RegTensor<float> bdh1;
+    RegTensor<float> termF0;
+    RegTensor<float> termF1;
+    RegTensor<T> term0;
+    RegTensor<T> term1;
+    MaskReg mask0;
+    MaskReg mask1;
+
+    // Two independent register chains are interleaved so load/cast and
+    // arithmetic instructions can dual-issue on A5.
+    for (uint16_t i = 0; i < loopCount; i += 2) {
+        mask0 = UpdateMask<float>(count);
+        DataCopy(bdh0, bdhAddr + i * ELEMS_PER_REG);
+        DataCopy<T, LoadDist::DIST_UNPACK_B16>(term0, termAddr + i * ELEMS_PER_REG);
+        if (i + 1 < loopCount) {
+            mask1 = UpdateMask<float>(count);
+            DataCopy(bdh1, bdhAddr + (i + 1) * ELEMS_PER_REG);
+            DataCopy<T, LoadDist::DIST_UNPACK_B16>(term1, termAddr + (i + 1) * ELEMS_PER_REG);
+        }
+        Cast<float, T, BWD_DHU_B16_TO_F32>(termF0, term0, mask0);
+        Muls(termF0, termF0, alpha, mask0);
+        Add(bdh0, bdh0, termF0, mask0);
+        if (i + 1 < loopCount) {
+            Cast<float, T, BWD_DHU_B16_TO_F32>(termF1, term1, mask1);
+            Muls(termF1, termF1, alpha, mask1);
+            Add(bdh1, bdh1, termF1, mask1);
+        }
+        DataCopy(bdhAddr + i * ELEMS_PER_REG, bdh0, mask0);
+        if (i + 1 < loopCount) {
+            DataCopy(bdhAddr + (i + 1) * ELEMS_PER_REG, bdh1, mask1);
+        }
+    }
+}
+#endif
+
 template <typename DT, typename GT>
 class GDRVec : public GDRBase<DT, GT>
 {
@@ -163,6 +211,10 @@ __aicore__ inline void GDRVec<DT, GT>::InitGlobalTensor(GM_ADDR q, GM_ADDR dv, G
 template <typename DT, typename GT>
 __aicore__ inline void GDRVec<DT, GT>::Process( )
 {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    // Publish the direct-term UB as free before AIC issues the first FixPipe.
+    CrossCoreSetFlag<0x4, PIPE_V>(A5_SYNC_AIV_AIC_TERM);
+#endif
     // 与 cube 一致：当前 for(h) for(chunkIdx)。若改为 chunk-major 以复用 cube 侧同一片 k 的搬运，须此处同序迭代，
     // 并用按 h 保存的 gLast/gLastExp（及等价状态）贯穿各 chunk 轮次，避免打乱 gatedQ/dv2 的跨 chunk 递推。
     uint32_t totalTaskNum = this->B * this->Hk * this->seqNum;
@@ -452,19 +504,37 @@ __aicore__ inline void GDRVec<DT, GT>::UpdateDh(const float gLastExp, uint64_t& 
         return;
     }
     // dh_updated = dh_i-1 * exp2(bg_last) + term1*scale - term2
-    CrossCoreWaitFlag(CROSS_CORE_C2V_TERM1); 
     {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+        CrossCoreWaitFlag<0x4, PIPE_V>(A5_SYNC_AIC_AIV_TERM);
+        auto bdhAddr = reinterpret_cast<__ubuf__ float*>(this->bdhCastLocal.GetPhyAddr());
+        auto termAddr = reinterpret_cast<__ubuf__ DT*>(this->qdoLocal.GetPhyAddr());
+        const float termScale = this->isScale ? this->scale : 1.0f;
+        AscendC::VF_CALL<UpdateDhTermVf<DT>>(bdhAddr, termAddr, termScale,
+                                            static_cast<uint32_t>(this->dhBufSize));
+        CrossCoreSetFlag<0x4, PIPE_V>(A5_SYNC_AIV_AIC_TERM);
+#else
+        CrossCoreWaitFlag(CROSS_CORE_C2V_TERM1);
         CopyIn(this->qdoCastLocal, this->qdoLocal, this->qdoGm[qdoOffset_], this->dhBufSize);
         if (this->isScale) {
             Axpy(this->bdhCastLocal, this->qdoCastLocal, this->scale, this->dhBufSize);
         } else {
             Add(this->bdhCastLocal, this->bdhCastLocal, this->qdoCastLocal, this->dhBufSize);
         }
+#endif
     }
-    CrossCoreWaitFlag(CROSS_CORE_C2V_TERM2);
     {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+        CrossCoreWaitFlag<0x4, PIPE_V>(A5_SYNC_AIC_AIV_TERM);
+        auto bdhAddr = reinterpret_cast<__ubuf__ float*>(this->bdhCastLocal.GetPhyAddr());
+        auto termAddr = reinterpret_cast<__ubuf__ DT*>(this->wv2Local.GetPhyAddr());
+        AscendC::VF_CALL<UpdateDhTermVf<DT>>(bdhAddr, termAddr, -1.0f,
+                                            static_cast<uint32_t>(this->dhBufSize));
+#else
+        CrossCoreWaitFlag(CROSS_CORE_C2V_TERM2);
         CopyIn(this->wv2CastLocal, this->wv2Local, this->wv2Gm[wV2Offset_], this->dhBufSize);
         Axpy(this->bdhCastLocal, this->wv2CastLocal, static_cast<float>(-1.0), this->dhBufSize);
+#endif
     }
     if (chunkIdx_ == 0) {
         CopyOut(this->bdhCastLocal, this->bdhCastLocal, this->dh0Gm[gmOffsetState_], this->dhBufSize, false);
@@ -472,6 +542,10 @@ __aicore__ inline void GDRVec<DT, GT>::UpdateDh(const float gLastExp, uint64_t& 
         CopyOut(this->bdhLocal, this->bdhCastLocal, this->dhGm[curGmOffsetH - dhBlockSize_], this->dhBufSize);
         CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_BDH);
     }
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    // bdhLocal aliases the direct-term UB, so release it only after CopyOut.
+    CrossCoreSetFlag<0x4, PIPE_V>(A5_SYNC_AIV_AIC_TERM);
+#endif
 }
 
 } // namespace ChunkGDRBwdDhu
