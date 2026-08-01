@@ -525,10 +525,13 @@ __aicore__ inline void GDRVec<DT, GT>::ApplyGk(LocalTensor<float> bdh)
     Muls(this->gkExpLocal, this->gkExpLocal, LN2, this->halfK);
     PipeBarrier<PIPE_V>();
     Exp(this->gkExpLocal, this->gkExpLocal, this->halfK);
-    PipeBarrier<PIPE_V>();
+    SetFlag<HardEvent::V_S>(EVENT_V_MTE3);
+    WaitFlag<HardEvent::V_S>(EVENT_V_MTE3);
     for (uint32_t row = 0; row < this->halfK; row++) {
         float decay = this->gkExpLocal.GetValue(row);
         Muls(bdh[row * this->V], bdh[row * this->V], decay, this->V);
+        SetFlag<HardEvent::V_S>(EVENT_V_MTE3);
+        WaitFlag<HardEvent::V_S>(EVENT_V_MTE3);
     }
 }
 
@@ -541,6 +544,8 @@ __aicore__ inline void GDRVec<DT, GT>::CalcGatedQ(float& gLast, float& gLastExp,
         gLastExp = 1.0f;
         return;
     }
+    // Both AIVs need the gate of the global last token for a tail chunk.
+    // A slice may contain no tail tokens, or may end before the other slice.
     if (this->curCalcBT == 0) {
         if (chunkIdx_ != 0 || this->hasH0) {
             CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_GQ);
@@ -553,12 +558,16 @@ __aicore__ inline void GDRVec<DT, GT>::CalcGatedQ(float& gLast, float& gLastExp,
             CopyIn(this->gCastLocal, this->gCastLocal, this->gGm[gmOffsetG_ + bos_], this->curBT, false);
             Muls(this->gExpLocal, this->gCastLocal, LN2, this->curBT);
             Exp(this->gExpLocal, this->gExpLocal, this->curBT);
+            SetFlag<HardEvent::V_S>(EVENT_V_MTE3);
+            WaitFlag<HardEvent::V_S>(EVENT_V_MTE3);
             gLast = this->gCastLocal.GetValue(static_cast<uint64_t>(this->curBT - 1));
             gLastExp = this->gExpLocal.GetValue(static_cast<uint64_t>(this->curBT - 1));
         } else {
             CopyIn(this->gCastLocal, this->gCastLocal, this->gGm[gmOffsetG_ + bos_], this->curCalcBT, false);
             Muls(this->gExpLocal, this->gCastLocal, LN2, this->curCalcBT);
             Exp(this->gExpLocal, this->gExpLocal, this->curCalcBT);
+            SetFlag<HardEvent::V_S>(EVENT_V_MTE3);
+            WaitFlag<HardEvent::V_S>(EVENT_V_MTE3);
             gLast = this->gCastLocal.GetValue(this->curCalcBT - 1);
             gLastExp = this->gExpLocal.GetValue(this->curCalcBT - 1);
         }
@@ -567,15 +576,32 @@ __aicore__ inline void GDRVec<DT, GT>::CalcGatedQ(float& gLast, float& gLastExp,
             CopyIn(this->gCastLocal, this->gLocal, this->gGm[gmOffsetG_ + bos_], this->curBT);
             Muls(this->gExpLocal, this->gCastLocal, LN2, this->curBT);
             Exp(this->gExpLocal, this->gExpLocal, this->curBT);
+            SetFlag<HardEvent::V_S>(EVENT_V_MTE3);
+            WaitFlag<HardEvent::V_S>(EVENT_V_MTE3);
             gLast = this->gCastLocal.GetValue(static_cast<uint64_t>(this->curBT - 1));
             gLastExp = this->gExpLocal.GetValue(static_cast<uint64_t>(this->curBT - 1));
         } else {
             CopyIn(this->gCastLocal, this->gLocal, this->gGm[gmOffsetG_ + bos_], this->curCalcBT);
             Muls(this->gExpLocal, this->gCastLocal, LN2, this->curCalcBT);
             Exp(this->gExpLocal, this->gExpLocal, this->curCalcBT);
+            SetFlag<HardEvent::V_S>(EVENT_V_MTE3);
+            WaitFlag<HardEvent::V_S>(EVENT_V_MTE3);
             gLast = this->gCastLocal.GetValue(this->curCalcBT - 1);
             gLastExp = this->gExpLocal.GetValue(this->curCalcBT - 1);
         }
+    }
+    if (isLastChunk) {
+        const uint64_t globalGateOffset =
+            gmOffsetG_ - static_cast<uint64_t>(this->subBlockIdx) * this->halfBT +
+            this->curBT - 1;
+        // Avoid BF16 scalar casts in the AIV backend. Copy through the
+        // existing GT->FP32 vector conversion path instead.
+        CopyIn(this->gCastLocal, this->gLocal, this->gGm[globalGateOffset], 1);
+        Muls(this->gCastLocal, this->gCastLocal, LN2, 1);
+        Exp(this->gCastLocal, this->gCastLocal, 1);
+        SetFlag<HardEvent::V_S>(EVENT_V_MTE3);
+        WaitFlag<HardEvent::V_S>(EVENT_V_MTE3);
+        gLastExp = this->gCastLocal.GetValue(0);
     }
     if (chunkIdx_ == 0 && !this->hasH0) {
         return; // chunkIdx==0时，不再需要更新dh，只需要拿到g和gLast用于计算dv2即可。
@@ -623,22 +649,33 @@ __aicore__ inline void GDRVec<DT, GT>::CalcDv2(const float gLast, uint64_t& curG
     } else {
         CopyIn(this->dvCastLocal, this->vInLocal, this->dvGm[curGmOffsetV], this->curCalcTV);
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+        // With dht, the last chunk also produces bdv; it follows the same
+        // AIC->AIV slot protocol after dht has initialized the boundary dh.
         const bool receivesDirectBdv = this->curCalcBT != 0;
         if (receivesDirectBdv) {
             CrossCoreWaitFlag<0x4, PIPE_V>(A5_SYNC_AIC_AIV_BDV_READY);
+        } else {
+            CrossCoreWaitFlag(CROSS_CORE_C2V_BDV);
+            CopyIn(this->bdvCastLocal, this->vInLocal, this->bdvGm[bdvOffset_], this->curCalcTV);
         }
 #else
         CrossCoreWaitFlag(CROSS_CORE_C2V_BDV); // cube计算完一个chunk的bdv,vec开始计算对应的dv2
-        CopyIn(this->bdvCastLocal, this->vInLocal, this->bdvGm[bdvOffset_], this->dvBufSize);
+        CopyIn(this->bdvCastLocal, this->vInLocal, this->bdvGm[bdvOffset_], this->curCalcTV);
 #endif
         if (this->hasG) {
             Muls(this->gCastLocal, this->gCastLocal, static_cast<float>(-1.0), this->curCalcBT);
+            PipeBarrier<PIPE_V>();
             Adds(this->gCastLocal, this->gCastLocal, gLast, this->curCalcBT);
+            PipeBarrier<PIPE_V>();
             Muls(this->gCastLocal, this->gCastLocal, LN2, this->curCalcBT);
+            PipeBarrier<PIPE_V>();
             Exp(this->gCastLocal, this->gCastLocal, this->curCalcBT);
+            PipeBarrier<PIPE_V>();
             uint8_t repeatTimes = Ceil(this->curCalcBT, FP32_PER_BLOCK);
             Brcb(this->gBrcbLocal, this->gCastLocal, repeatTimes, {1,FP32_PER_BLOCK});
+            PipeBarrier<PIPE_V>();
             BlockMul(this->bdvCastLocal, this->gBrcbLocal, this->bdvCastLocal, this->curCalcBT, this->V);
+            PipeBarrier<PIPE_V>();
         }
         Add(this->bdvCastLocal, this->bdvCastLocal, this->dvCastLocal, this->curCalcTV);
         CopyOut(this->vInLocal, this->bdvCastLocal, this->dv2Gm[curGmOffsetV], this->curCalcTV);
@@ -665,6 +702,7 @@ __aicore__ inline void GDRVec<DT, GT>::UpdateDh(const float gLastExp, uint64_t& 
     curGmOffsetH = gmOffsetH_ + chunkIdx_ * dhBlockSize_;
     if (this->hasG) {
         Muls(this->bdhCastLocal, this->bdhCastLocal, gLastExp, this->dhBufSize);
+        PipeBarrier<PIPE_V>();
     }
     ApplyGk(this->bdhCastLocal);
     if (chunkIdx_ == 0 && !this->hasH0) {
