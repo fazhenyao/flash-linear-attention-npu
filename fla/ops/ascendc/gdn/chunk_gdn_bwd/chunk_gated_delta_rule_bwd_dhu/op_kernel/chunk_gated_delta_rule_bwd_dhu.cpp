@@ -38,7 +38,7 @@ __aicore__ inline void ChunkGatedDeltaRuleBwdDhuKernelImpl(
     const ChunkGatedDeltaRuleBwdDhuTilingData *tilingData)
 {
     if ASCEND_IS_AIC {
-        GDRCube<DT, GT> cubeOp(k, w, d_o, dh, dv2, cu_seqlens, chunk_indices, userWS);
+        GDRCube<DT, GT> cubeOp(q, k, w, d_o, dh, dv2, cu_seqlens, chunk_indices, userWS);
         cubeOp.Init(*tilingData);
         cubeOp.Process();
     }

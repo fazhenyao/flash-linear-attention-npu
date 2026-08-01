@@ -47,6 +47,27 @@ constexpr uint8_t CROSS_CORE_V2C_BDH = 5;  // vec更新完dh,通知cube進行下
 constexpr uint64_t A5_FLAG_ID_MAX = 16;
 constexpr uint64_t A5_SYNC_AIV_AIC_TERM = 6;
 constexpr uint64_t A5_SYNC_AIC_AIV_TERM = 7;
+constexpr uint64_t A5_SYNC_AIV_AIC_BDH_READY = 8;
+constexpr uint64_t A5_SYNC_AIV_AIC_BDV_FREE = 9;
+constexpr uint64_t A5_SYNC_AIC_AIV_BDV_READY = 10;
+constexpr uint64_t A5_SYNC_AIV_AIC_DV2_READY = 11;
+constexpr uint64_t A5_L1_SIZE_BYTES = 512 * 1024;
+constexpr uint64_t A5_L1A_BDV_SIZE_BYTES = 128 * 128 * HALF_DTYPE_SIZE;
+constexpr uint64_t A5_L1B_BDV_SIZE_BYTES = 128 * 256 * HALF_DTYPE_SIZE;
+constexpr uint64_t A5_L1A_DH_SIZE_BYTES = 128 * 128 * HALF_DTYPE_SIZE;
+constexpr uint64_t A5_L1B_DH_SIZE_BYTES = 128 * 256 * HALF_DTYPE_SIZE;
+constexpr uint64_t A5_L1B_DV2_OFFSET_BYTES =
+    A5_L1A_BDV_SIZE_BYTES + A5_L1B_BDV_SIZE_BYTES +
+    A5_L1A_DH_SIZE_BYTES + A5_L1B_DH_SIZE_BYTES + A5_L1A_DH_SIZE_BYTES;
+constexpr uint32_t A5_BDH_L1_K_STRIDE = 128;
+constexpr uint32_t A5_DV2_L1_K_STRIDE = 128;
+
+__aicore__ constexpr uint64_t GetA5DirectBdvUbOffset(uint64_t bt, uint64_t v)
+{
+    const uint64_t halfBt = bt / 2;
+    return bt * FLOAT_DTYPE_SIZE + halfBt * BLOCK_SIZE +
+           halfBt * v * (HALF_DTYPE_SIZE + FLOAT_DTYPE_SIZE);
+}
 
 
 template <typename DT, typename GT>
@@ -103,6 +124,7 @@ protected:
     LocalTensor<DT> qdoLocal; // [K/2,V]
     LocalTensor<float> qdoCastLocal;
     LocalTensor<GT> gkLocal;
+    LocalTensor<float> gkExpLocal;
     
     // tiling data
     uint64_t B = 0;

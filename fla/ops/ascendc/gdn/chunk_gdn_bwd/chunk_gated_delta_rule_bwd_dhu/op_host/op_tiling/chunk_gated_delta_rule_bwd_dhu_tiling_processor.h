@@ -316,6 +316,8 @@ public:
         const uint32_t dqkBufByte = halfBT * static_cast<uint32_t>(K_) * CHUNK_GDR_BWD_DHU_HALF_DTYPE_SIZE;
         const uint32_t dqkCastBufByte = halfBT * static_cast<uint32_t>(K_) * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE;
         const uint32_t dhCastBufByte = halfK * static_cast<uint32_t>(V_) * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE;
+        const uint32_t gkExpScratchByte =
+            halfK * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE;
 
         const uint32_t dvPeak =
             static_cast<uint32_t>(chunkSize_) * CHUNK_GDR_BWD_DHU_FP32_DTYPE_SIZE + gBrcbBufByte + dvBufByte +
@@ -326,7 +328,7 @@ public:
         const uint32_t dhScratch = dhCastBufByte +
                                    halfK * static_cast<uint32_t>(V_) * CHUNK_GDR_BWD_DHU_HALF_DTYPE_SIZE;
         const uint32_t scratchPeak = std::max(dhScratch, std::max(dvPeak, gatedQPeak));
-        const uint32_t tBufByte = scratchPeak + dhCastBufByte;
+        const uint32_t tBufByte = scratchPeak + dhCastBufByte + gkExpScratchByte;
 
         OP_CHECK_IF(tBufByte > ctx_.ubSize,
                     OP_LOGE(ctx_.nodeName, "K/V is too large, K should less than 128 and V should less than 256."),

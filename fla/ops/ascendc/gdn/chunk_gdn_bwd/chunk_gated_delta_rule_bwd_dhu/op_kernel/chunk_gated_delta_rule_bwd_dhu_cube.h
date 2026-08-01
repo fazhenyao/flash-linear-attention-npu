@@ -145,6 +145,7 @@ public:
     static constexpr auto L1B_LAYOUT_DH2 = tla::MakeLayout<ElementDv2, LayoutTagL1B_Dh2>(Int<L1_TILE_K_DH>{}, Int<L1_TILE_N_DH>{});
 
     struct Params {
+        GM_ADDR q;
         GM_ADDR k;
         LayoutK layoutK;
         GM_ADDR dh; // from output dh
@@ -171,6 +172,7 @@ public:
         uint64_t seqNum = 0;
         uint64_t usedCoreNum = 0;
         bool isVarLen = false;
+        bool hasG = false;
         bool hasDht = false;
         bool hasH0 = false;
         uint64_t bdvWorkspaceOffset = 0;
@@ -183,13 +185,14 @@ public:
         Params() {}
 
         CATLASS_HOST_DEVICE
-        Params(GM_ADDR k_, LayoutK layoutK_, GM_ADDR dh_, LayoutDh layoutDh_, GM_ADDR workspace_,  LayoutBdv layoutBdv_, 
+        Params(GM_ADDR q_, GM_ADDR k_, LayoutK layoutK_, GM_ADDR dh_, LayoutDh layoutDh_, GM_ADDR workspace_, LayoutBdv layoutBdv_,
                LayoutGq layoutGq_, GM_ADDR dO_, LayoutDo layoutDo_,    
                GM_ADDR w_ , LayoutW layoutW_, GM_ADDR dv2_ , LayoutDv2 layoutDv2_, LayoutBdh layoutBdh_,
                GM_ADDR cu_seqlens_, uint64_t B_, uint64_t T_, uint64_t Hv_, uint64_t Hk_, uint64_t K_, uint64_t V_,
-               uint64_t BT_, uint64_t chunkNum_, uint64_t seqNum_, uint64_t usedCoreNum_, bool isVarLen_,
+               uint64_t BT_, uint64_t chunkNum_, uint64_t seqNum_, uint64_t usedCoreNum_, bool isVarLen_, bool hasG_,
                bool hasDht_, bool hasH0_,
                uint64_t bdvWorkspaceOffset_, uint64_t gQWorkspaceOffset_,uint64_t bdhTerm1WorkspaceOffset_, uint64_t bdhTerm2WorkspaceOffset_): 
+            q(q_),
             k(k_), 
             layoutK(layoutK_),
             dh(dh_),
@@ -216,6 +219,7 @@ public:
             seqNum(seqNum_),
             usedCoreNum(usedCoreNum_),
             isVarLen(isVarLen_),
+            hasG(hasG_),
             hasDht(hasDht_),
             hasH0(hasH0_),
             bdvWorkspaceOffset(bdvWorkspaceOffset_),
@@ -273,9 +277,14 @@ public:
         l0CTensorTerm2 = l0CTensor;
 #endif
 #if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
-        // This byte offset matches qdoLocal/wv2Local on both AIV sub-blocks.
-        const uint64_t directTermUbOffset = params.K / 2 * params.V * sizeof(float);
-        directTermUb = resource.ubBuf.template GetBufferByByte<ElementBdh>(directTermUbOffset);
+        // qdoCastLocal/wv2CastLocal share the FP32 region at UB offset 0.
+        directTermUb = resource.ubBuf.template GetBufferByByte<float>(0);
+        const bool useDirectDhL1 =
+            params.K >= 32 && params.K <= 128 && params.K % 32 == 0 &&
+            params.V <= 256 && params.V % 16 == 0;
+        const bool useDirectDv2L1 =
+            params.BT >= 32 && params.BT <= 128 && params.BT % 32 == 0 &&
+            params.V <= 256 && params.V % 16 == 0;
 #endif
         {
             // 每个核完成一个 batch 内一个 q/k 头 hq、一条序列上的所有 chunk；组内各 value 头 h 串行处理（GVA 方案 A）
@@ -322,12 +331,25 @@ public:
                         using CopyGmToL1B_Bdv = typename TileCopyBdv::template CopyGmToL1B<decltype(tensorBlockDh)>;
 #if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
                         using CopyL0CToGm_Bdv = typename TileCopyBdv::template CopyL0CToDst<decltype(tensorBlockBdv)>;
+                        // AIC and AIV derive this address from the same Ascend950 resource UB layout.
+                        const uint64_t directBdvUbOffset = GetA5DirectBdvUbOffset(params.BT, params.V);
+                        auto directBdvUb = resource.ubBuf.template GetBufferByByte<float>(directBdvUbOffset);
+                        auto directBdvLayout = tla::MakeLayout<float, layout::RowMajor>(curBT, params.V);
+                        auto directBdvTensor = tla::MakeTensor(directBdvUb, directBdvLayout, Arch::PositionUB{});
+                        auto directBdvBlock = GetTile(directBdvTensor, tla::MakeCoord(0, 0),
+                                                      tla::MakeShape(curBT, params.V));
+                        using CopyL0CToUbBdv = Common::Tile::CopyL0CToUBTla<
+                            ArchTag, typename TileCopyBdv::TensorL0C, decltype(directBdvBlock),
+                            Gemm::Tile::CopyL0CToUBMode::NO_SPLIT>;
 #else
                         using CopyL0CToGm_Bdv = typename TileCopyBdv::template CopyL0CToGm<decltype(tensorBlockBdv)>;
 #endif
                         CopyGmToL1A_Bdv copyGmToL1A_Bdv;
                         CopyGmToL1B_Bdv copyGmToL1B_Bdv;
                         CopyL0CToGm_Bdv copyL0CToGm_Bdv;
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        CopyL0CToUbBdv copyL0CToUbBdv;
+#endif
 
                         // load L1A
                         auto tensorL1A = tla::MakeTensor(l1ATensorBdv, L1A_LAYOUT_BDV, Arch::PositionL1{});
@@ -349,17 +371,39 @@ public:
                         copyL1ToL0A_Bdv(tensorL0A, tensorTileL1A);
 
                         // load L1B
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        if (useDirectDhL1) {
+                            CrossCoreWaitFlag<0x4, PIPE_MTE1>(A5_SYNC_AIV_AIC_BDH_READY);
+                            CrossCoreWaitFlag<0x4, PIPE_MTE1>(A5_SYNC_AIV_AIC_BDH_READY + A5_FLAG_ID_MAX);
+                        } else {
+                            CrossCoreWaitFlag(CROSS_CORE_V2C_BDH);
+                        }
+#else
                         CrossCoreWaitFlag(CROSS_CORE_V2C_BDH);
+#endif
                         auto tensorL1B = tla::MakeTensor(l1BTensorBdv, L1B_LAYOUT_BDV, Arch::PositionL1{});
                         auto tensorGmTileB = GetTile(tensorBlockDh, tla::MakeCoord(0, 0), tla::MakeShape(params.K, params.V));
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        if (!useDirectDhL1) {
+                            copyGmToL1B_Bdv(tensorL1B, tensorGmTileB);
+                            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1B);
+                        }
+#else
                         copyGmToL1B_Bdv(tensorL1B, tensorGmTileB);
                         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1B);
+#endif
 
                         // copy L1B -> L0B
                         auto layoutBInL0 = tla::MakeLayout<ElementDh, LayoutTagL0B_Bdv>(params.K, params.V);
                         auto tensorL0B = tla::MakeTensor(l0BTensorBdv, layoutBInL0, Arch::PositionL0B{});
                         auto tensorTileL1B = GetTile(tensorL1B,  tla::MakeCoord(0, 0), tla::MakeShape(params.K, params.V));
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        if (!useDirectDhL1) {
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1B);
+                        }
+#else
                         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_BDV_L1B);
+#endif
                         copyL1ToL0B_Bdv(tensorL0B, tensorTileL1B);
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_BDV_L0_READY);
 
@@ -378,16 +422,46 @@ public:
                         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_BDV_L0A_FREE);
                         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_BDV_L0B_FREE);
                         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_BDV_L0C);
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        const uint8_t bdvSendVecNum = curBT > params.BT / 2 ? 2 : 1;
+                        CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_BDV_FREE);
+                        if (bdvSendVecNum == 2) {
+                            CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_BDV_FREE + A5_FLAG_ID_MAX);
+                        }
+                        auto directBdvSrc = GetTile(tensorL0C, tla::MakeCoord(0, 0),
+                                                    tla::MakeShape(curBT, params.V));
+                        if (bdvSendVecNum == 2) {
+                            copyL0CToUbBdv(directBdvBlock, directBdvSrc, params.BT / 2, 0, 2, unitFlag);
+                        } else {
+                            copyL0CToUbBdv(directBdvBlock, directBdvSrc, 0, unitFlag);
+                        }
+#else
                         copyL0CToGm_Bdv(tensorBlockBdv, tensorL0C);
+#endif
                         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_BDV_L0C);
                         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_BDV_L0C);
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        CrossCoreSetFlag<0x4, PIPE_FIX>(A5_SYNC_AIC_AIV_BDV_READY);
+                        if (bdvSendVecNum == 2) {
+                            CrossCoreSetFlag<0x4, PIPE_FIX>(A5_SYNC_AIC_AIV_BDV_READY + A5_FLAG_ID_MAX);
+                        }
+#else
                         CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_BDV); // 计算完一个chunk的bdv,通知vec可以开始计算对应的dv2
+#endif
                     } // end chunk k @ dh
                     
 
                     if (chunkIdx != 0 || params.hasH0)
                     {
-                        gmGq.SetGlobalBuffer((__gm__ ElementGq *)params.workspace + params.gQWorkspaceOffset + coreIdx * params.BT * params.K);
+                        if (params.hasG) {
+                            gmGq.SetGlobalBuffer((__gm__ ElementGq *)params.workspace +
+                                                params.gQWorkspaceOffset + coreIdx * params.BT * params.K);
+                        } else {
+                            // KDA supplies qg directly in q. RowMajor [BT,K] and ColumnMajor
+                            // [K,BT] have the same physical layout, so no transpose is needed.
+                            gmGq.SetGlobalBuffer((__gm__ ElementGq *)params.q + gmOffsetQK +
+                                                chunkIdx * params.BT * params.K);
+                        }
                         gmDo.SetGlobalBuffer((__gm__ ElementDo *)params.dO + gmOffsetV + chunkIdx * params.BT * params.V);
                         gmDhTerm1.SetGlobalBuffer(
                             (__gm__ ElementBdh *)((__gm__ uint8_t *)params.workspace + params.bdhTerm1WorkspaceOffset) +
@@ -428,7 +502,7 @@ public:
                         using CopyGmToL1A_Dh1 = typename TileCopyDh1::template CopyGmToL1A<decltype(tensorBlockGq)>;
                         using CopyGmToL1B_Dh1 = typename TileCopyDh1::template CopyGmToL1B<decltype(tensorBlockDo)>;
 #if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
-                        auto directTermLayout = tla::MakeLayout<ElementBdh, layout::RowMajor>(params.K, params.V);
+                        auto directTermLayout = tla::MakeLayout<float, layout::RowMajor>(params.K, params.V);
                         auto directTermTensor = tla::MakeTensor(directTermUb, directTermLayout, Arch::PositionUB{});
                         auto directTermBlock = GetTile(directTermTensor, tla::MakeCoord(0, 0),
                                                        tla::MakeShape(params.K, params.V));
@@ -481,7 +555,7 @@ public:
                         auto tensorTileL0C1 = GetTile(tensorL0C1,
                                                     tla::MakeCoord(0,0),
                                                     tla::MakeShape(params.K, params.V));
-                        auto tensorL1B2 = tla::MakeTensor(l1BTensorDh2, L1B_LAYOUT_DH1, Arch::PositionL1{});
+                        auto tensorL1B2 = tla::MakeTensor(l1BTensorDh2, L1B_LAYOUT_DH2, Arch::PositionL1{});
                         auto tensorGmTileB2 = GetTile(tensorBlockDv2, tla::MakeCoord(0, 0), tla::MakeShape(curBT, params.V));
                         
                         auto layoutBInL02 = tla::MakeLayout<ElementDv2, LayoutTagL0B_Dh2>(curBT, params.V);
@@ -513,7 +587,9 @@ public:
                         copyL1ToL0A_Dh2(tensorL0A2, tensorTileL1A2);
 
                         // load L1A
-                        CrossCoreWaitFlag(CROSS_CORE_V2C_GQ); // vec计算完一个chunk的gatedQ,通知cube可以开始计算对应的dh term1
+                        if (params.hasG) {
+                            CrossCoreWaitFlag(CROSS_CORE_V2C_GQ);
+                        }
                         copyGmToL1A_Dh1(tensorL1A1, tensorGmTileA1);
                         constexpr uint32_t EVENT_TERM1_L1A_READY = 0;
                         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_TERM1_L1A_READY);
@@ -532,13 +608,30 @@ public:
                         AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_TERM1_L0C);
 
                         // Prefetch dv2 while term1 is running; the two operands use independent L1 buffers.
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        if (useDirectDv2L1) {
+                            CrossCoreWaitFlag<0x4, PIPE_MTE1>(A5_SYNC_AIV_AIC_DV2_READY);
+                            CrossCoreWaitFlag<0x4, PIPE_MTE1>(A5_SYNC_AIV_AIC_DV2_READY + A5_FLAG_ID_MAX);
+                        } else {
+                            CrossCoreWaitFlag(CROSS_CORE_V2C_DV2);
+                            copyGmToL1B_Dh2(tensorL1B2, tensorGmTileB2);
+                            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_TERM_L1B);
+                        }
+#else
                         CrossCoreWaitFlag(CROSS_CORE_V2C_DV2);
                         copyGmToL1B_Dh2(tensorL1B2, tensorGmTileB2);
                         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_TERM_L1B);
+#endif
 
                         // Overlap term1 FIX writeback with the term2 L1-to-L0B transfer.
                         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_TERM_L0B);
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+                        if (!useDirectDv2L1) {
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_TERM_L1B);
+                        }
+#else
                         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_TERM_L1B);
+#endif
                         copyL1ToL0B_Dh2(tensorL0B2, tensorTileL1B2);
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_TERM_L0B);
 
@@ -585,9 +678,8 @@ public:
             }
         }
 #if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
-        // Consume the final pair of free tokens so no 0x4 event escapes the kernel.
-        CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_TERM);
-        CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_TERM + A5_FLAG_ID_MAX);
+        CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_BDV_FREE);
+        CrossCoreWaitFlag<0x4, PIPE_FIX>(A5_SYNC_AIV_AIC_BDV_FREE + A5_FLAG_ID_MAX);
 #endif
         return;
     }
@@ -653,7 +745,7 @@ private:
     AscendC::LocalTensor<DT> l0BTensorDh;
     AscendC::LocalTensor<ElementAccumulator> l0CTensor;
     AscendC::LocalTensor<ElementAccumulator> l0CTensorTerm2;
-    AscendC::LocalTensor<ElementBdh> directTermUb;
+    AscendC::LocalTensor<float> directTermUb;
 
     int32_t l1AEventId = 0;
     int32_t l1BEventId = 1;
@@ -685,12 +777,12 @@ template <typename DT, typename GT>
 class GDRCube : public GDRBase<DT, GT>
 {
 public:
-    __aicore__ inline GDRCube(GM_ADDR k_, GM_ADDR w_, GM_ADDR dO_, GM_ADDR dh_, GM_ADDR dv2_, GM_ADDR cu_seqlens_, 
+    __aicore__ inline GDRCube(GM_ADDR q_, GM_ADDR k_, GM_ADDR w_, GM_ADDR dO_, GM_ADDR dh_, GM_ADDR dv2_, GM_ADDR cu_seqlens_,
                               GM_ADDR chunk_indices_, GM_ADDR workspace_);
     __aicore__ inline void Process();
     __aicore__ inline void Init(const ChunkGatedDeltaRuleBwdDhuTilingData& tilingData);
 private:
-    GM_ADDR workspaceGq;
+    GM_ADDR q;
     GM_ADDR k;
     GM_ADDR w;
     GM_ADDR dO;
@@ -703,9 +795,10 @@ private:
 }; // class GDRCube
 
 template <typename DT, typename GT>
-__aicore__ inline GDRCube<DT, GT>::GDRCube(GM_ADDR k_, GM_ADDR w_, GM_ADDR dO_, GM_ADDR dh_, GM_ADDR dv2_, GM_ADDR cu_seqlens_, 
+__aicore__ inline GDRCube<DT, GT>::GDRCube(GM_ADDR q_, GM_ADDR k_, GM_ADDR w_, GM_ADDR dO_, GM_ADDR dh_, GM_ADDR dv2_, GM_ADDR cu_seqlens_,
                                        GM_ADDR chunk_indices_, GM_ADDR workspace_)
 :
+    q(q_),
     k(k_),
     w(w_),
     dO(dO_),
@@ -796,11 +889,12 @@ __aicore__ inline void GDRCube<DT, GT>::Process()
                                                       L1TileShapeDh, L0TileShapeDh, TileCopyDh1, TileCopyDh2>;
     this->pipe.Destroy();
     GDRKernel kernel;
-    typename GDRKernel::Params param{k, layoutK, dh, layoutDh, workspace, layoutBdv, // k @ dh -> bdv[workspace ]
+    typename GDRKernel::Params param{q, k, layoutK, dh, layoutDh, workspace, layoutBdv, // k @ dh -> bdv[workspace ]
                                      layoutGq, dO, layoutDo,                // gatedQ^T[workspace ] @ do -> bdh[workspace]
                                      w, layoutW, dv2, layoutDv2, layoutBdh, // w^T @ dv2 -> bdh[workspace] 
                                      cu_seqlens, this->B, this->T, this->Hv, this->Hk, this->K, this->V, 
                                      this->chunkSize, this->chunkNum, this->seqNum, this->usedCoreNum, static_cast<bool>(this->isVarLen),
+                                     static_cast<bool>(this->hasG),
                                      static_cast<bool>(this->hasDht), static_cast<bool>(this->hasH0),
                                      bdvWorkspaceOffset, gQWorkspaceOffset, bdhTerm1WorkspaceOffset, bdhTerm2WorkspaceOffset};
     kernel(param);
