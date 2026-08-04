@@ -264,6 +264,15 @@ bool ResolveChunkLocalCumsumOutputDtype(
         TORCH_CHECK(
             g_.dim() == 3 && g_.size(0) == B && g_.size(1) == Hv && g_.size(2) == T,
             "npu_chunk_gated_delta_rule_bwd_dhu: g must be [B,Hv,T]; g=", g_.sizes());
+        TORCH_CHECK(
+            g_.scalar_type() == q.scalar_type() || g_.scalar_type() == at::kFloat,
+            "npu_chunk_gated_delta_rule_bwd_dhu: g dtype must match q or be float32; q=",
+            q.scalar_type(), " g=", g_.scalar_type());
+    }
+    if (gK_.defined()) {
+        TORCH_CHECK(
+            gK_.dim() == 4 && gK_.size(0) == B && gK_.size(1) == Hv && gK_.size(2) == T && gK_.size(3) == K,
+            "npu_chunk_gated_delta_rule_bwd_dhu: gK must be [B,Hv,T,K]; gK=", gK_.sizes());
     }
     if (h0_.defined()) {
         TORCH_CHECK(
@@ -278,11 +287,23 @@ bool ResolveChunkLocalCumsumOutputDtype(
             " chunk_num=", chunk_num);
     }
 
+    at::Tensor gKernel = g_;
+    at::Tensor gKKernel = gK_.defined() ? gK_.to(at::kFloat) : gK_;
+    if (use_exp2.value_or(false)) {
+        constexpr double LN2 = 0.6931471805599453;
+        if (g_.defined()) {
+            gKernel = g_.to(at::kFloat) * LN2;
+        }
+        if (gK_.defined()) {
+            gKKernel = gKKernel * LN2;
+        }
+    }
+
     // 调用ACLNN算子
     EXEC_NPU_CMD_EXT(
         aclnnChunkGatedDeltaRuleBwdDhu,
         q, k, w, d_o, dv,
-        g_, gK_, h0_, dht_,
+        gKernel, gKKernel, h0_, dht_,
         cu_seqlens, chunk_indices,
         scale, chunk_size,
         dh, dh0, dv2

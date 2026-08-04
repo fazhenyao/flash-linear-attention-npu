@@ -231,6 +231,11 @@ def npu_chunk_gated_delta_rule_bwd_dhu(
     use_exp2=False,
     transpose_state_layout=False,
 ):
+    gK = gK.float() if gK is not None else None
+    if use_exp2:
+        ln2 = 0.6931471805599453
+        g = g.float() * ln2 if g is not None else None
+        gK = gK * ln2 if gK is not None else None
     q_shape = _shape(q)
     dv_shape = _shape(dv)
     B, _, T, K = q_shape

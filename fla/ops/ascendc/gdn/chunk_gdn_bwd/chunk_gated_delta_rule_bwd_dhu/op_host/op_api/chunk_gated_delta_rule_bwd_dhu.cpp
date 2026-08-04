@@ -10,6 +10,7 @@
 #include "opdev/op_log.h"
 #include "opdev/op_dfx.h"
 #include "opdev/make_op_executor.h"
+#include "aclnn_kernels/cast.h"
 #include "chunk_gated_delta_rule_bwd_dhu.h"
 
 using namespace op;
@@ -67,8 +68,17 @@ const std::array<const aclTensor *, 3> ChunkGatedDeltaRuleBwdDhu(
         dh0OutKernel = dh0Out;
     }
 
+    const aclTensor *gkKernel = gkOptional;
+    if (gkKernel != nullptr && gkKernel->GetDataType() != op::DataType::DT_FLOAT) {
+        gkKernel = l0op::Cast(gkKernel, op::DataType::DT_FLOAT, executor);
+        if (gkKernel == nullptr) {
+            OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "Cast gkOptional to FP32 failed.");
+            return {nullptr, nullptr, nullptr};
+        }
+    }
+
     auto ret = ADD_TO_LAUNCHER_LIST_AICORE(ChunkGatedDeltaRuleBwdDhu,
-        OP_INPUT(q, k, w, dO, dv, gOptional, gkOptional, h0Optional, dhtOptional, actualCuSeqQLen, actualChunkIndices),
+        OP_INPUT(q, k, w, dO, dv, gOptional, gkKernel, h0Optional, dhtOptional, actualCuSeqQLen, actualChunkIndices),
         OP_OUTPUT(dhOut, dh0OutKernel, dv2Out),
         OP_ATTR(scale, chunkSize));
     if (ret != ACLNN_SUCCESS) {

@@ -247,13 +247,14 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
     cu_seqlens: Optional[List[int]] = None,
     chunk_indices: Optional[List[int]] = None,
     g: Optional[torch.Tensor] = None,
+    gk: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     chunk_size: int = 64,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """
     PyTorch 版 chunk_gated_delta_rule_bwd_dhu（GVA 形状）。
     - q, k: [B, Hk, T, K]
-    - w, do, dv, (可选 g): [B, Hv, T, ·]；须 Hv % Hk == 0
+    - w, do, dv, (可选 g/gk): [B, Hv, T, ·]；须 Hv % Hk == 0
     - value 头 h 对应 q/k 头 hq = h // (Hv // Hk)
     支持定长 (cu_seqlens=None) 与变长 (cu_seqlens!=None)。
     """
@@ -374,6 +375,9 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
             else:
                 b_dh_for_update = b_dh.clone()
                 b_q_gated = b_q_t
+            if gk is not None:
+                gk_last = gk[:, :, global_last_idx, :].to(torch.float32)
+                b_dh_for_update = b_dh_for_update * torch.exp(gk_last).unsqueeze(-1)
 
             term1 = torch.matmul(b_q_gated.to(torch.float), b_do.to(torch.float)) * scale
             term2 = torch.matmul(b_w_t.to(torch.float), b_dv.to(torch.float))
@@ -431,6 +435,9 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
                     b_dh_for_update = b_dh.clone()
                     if g is not None:
                         b_dh_for_update = b_dh_for_update * bg_last_exp
+                    if gk is not None:
+                        gk_last = gk[b, i_h, global_last_idx, :].to(torch.float32)
+                        b_dh_for_update = b_dh_for_update * torch.exp(gk_last).unsqueeze(-1)
 
                     b_q_gated = b_q_t
                     if g is not None:
@@ -508,6 +515,49 @@ def test_fix(
     ct.single(dv2_npu_cpu, dv2_golden)
     assert_finite_after_npu_golden_compare(dh_npu_cpu, dv2_npu_cpu, dh_golden, dv2_golden)
     print(f"test_fix 被调用了第 {test_fix.call_count} 次")
+
+
+def test_fix_gate_combination(
+    *,
+    use_g: bool,
+    use_gk: bool,
+    use_exp2: bool = False,
+    seed: int = 0,
+):
+    B, Hk, Hv, T, K, V, chunk_size = 1, 2, 4, 96, 64, 64, 64
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(K)
+    torch.manual_seed(seed)
+    q, k, w, d_o, dv, g = create_bwd_dhu_random_inputs(B, Hk, Hv, T, K, V, dtype, torch.float32)
+    g = g if use_g else None
+    gk = torch.linspace(-0.02, -0.001, T * K, dtype=torch.float32).reshape(1, 1, T, K)
+    gk = gk.expand(B, Hv, T, K).contiguous() if use_gk else None
+
+    golden_g = g
+    golden_gk = gk
+    if use_exp2:
+        ln2 = math.log(2.0)
+        golden_g = g.float() * ln2 if g is not None else None
+        golden_gk = gk.float() * ln2 if gk is not None else None
+
+    dh_golden, _, dv2_golden = chunk_gated_delta_rule_bwd_dhu_torch(
+        q, k, w, d_o, dv, g=golden_g, gk=golden_gk, scale=scale, chunk_size=chunk_size
+    )
+    dh_npu, _, dv2_npu = torch.ops.npu.npu_chunk_gated_delta_rule_bwd_dhu(
+        q.npu(), k.npu(), w.npu(), d_o.npu(), dv.npu(),
+        scale=scale,
+        chunk_size=chunk_size,
+        g=g.npu() if g is not None else None,
+        gK=gk.npu() if gk is not None else None,
+        h0=None,
+        dht=None,
+        cu_seqlens=None,
+        chunk_indices=None,
+        use_exp2=use_exp2,
+        transpose_state_layout=False,
+    )
+    ct.single(dh_npu.cpu(), dh_golden)
+    ct.single(dv2_npu.cpu(), dv2_golden)
 
 
 def test_variable(
@@ -594,5 +644,10 @@ if __name__ == "__main__":
     test_fix(B=1, Hk=2, Hv=4, T=320, K=128, V=128, chunk_size=128, scale=0.088, ktype=torch.bfloat16, gtype=torch.bfloat16)
     # MHA smoke: Hk=Hv
     test_fix(B=1, Hk=4, Hv=4, T=128, K=128, V=128, chunk_size=64, scale=0.088, ktype=torch.bfloat16, gtype=torch.bfloat16)
+    # Gate presence matrix, including a tail chunk shorter than halfBT.
+    test_fix_gate_combination(use_g=False, use_gk=False)
+    test_fix_gate_combination(use_g=True, use_gk=False)
+    test_fix_gate_combination(use_g=False, use_gk=True)
+    test_fix_gate_combination(use_g=True, use_gk=True, use_exp2=True)
     # GVA varlen smoke
     test_variable(B=1, Hk=4, Hv=8, T=512, K=128, V=128, chunk_size=64, scale=0.011, cu_seqlens_len=4, ktype=torch.bfloat16, gtype=torch.bfloat16)

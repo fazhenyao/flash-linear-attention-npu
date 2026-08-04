@@ -43,7 +43,7 @@ constexpr uint8_t CROSS_CORE_C2V_TERM2 = 4;  // cube算完dh_term2,通知vec搬�
 constexpr uint8_t CROSS_CORE_V2C_BDH = 5;  // vec更新完dh,通知cube進行下個chunk的bdv計算
 
 
-template <typename DT, typename GT>
+template <typename DT, typename GT, typename GKT = float>
 class GDRBase {
 public:
     __aicore__ inline GDRBase(){};
@@ -59,6 +59,7 @@ protected:
     // inputGm
     GlobalTensor<DT> qGm;
     GlobalTensor<GT> gGm;
+    GlobalTensor<GKT> gkGm;
     GlobalTensor<DT> dvGm;
     GlobalTensor<int64_t> cuSeqlensGm;
     // output gm, also used as input
@@ -116,6 +117,8 @@ protected:
     uint64_t qDoWs = 0;
     uint64_t isVarLen = 0;
     uint64_t isScale = 0;
+    uint64_t hasG = 0;
+    uint64_t hasGk = 0;
     uint32_t usedCoreNum = 0;
     float  scale = 0;
 
@@ -130,8 +133,8 @@ protected:
     uint32_t curCalcTV = 0;
 };
 
-template <typename DT, typename GT>
-__aicore__ inline void GDRBase<DT, GT>::InitTilingData(const ChunkGatedDeltaRuleBwdDhuTilingData& tilingData)
+template <typename DT, typename GT, typename GKT>
+__aicore__ inline void GDRBase<DT, GT, GKT>::InitTilingData(const ChunkGatedDeltaRuleBwdDhuTilingData& tilingData)
 {
     this->B = tilingData.B;
     this->Hv = tilingData.Hv;
@@ -154,6 +157,8 @@ __aicore__ inline void GDRBase<DT, GT>::InitTilingData(const ChunkGatedDeltaRule
     this->qDoWs = tilingData.qDoWs;
     this->isVarLen = tilingData.isVarLen;
     this->isScale = tilingData.isScale;
+    this->hasG = tilingData.hasG;
+    this->hasGk = tilingData.hasGk;
     this->usedCoreNum = tilingData.usedCoreNum;
     this->scale = tilingData.scale;
     this->coreIdx = GetBlockIdx();
@@ -163,8 +168,8 @@ __aicore__ inline void GDRBase<DT, GT>::InitTilingData(const ChunkGatedDeltaRule
 
 }
 
-template <typename DT, typename GT>
-__aicore__ inline void GDRBase<DT, GT>::BroadCastAndMul(const LocalTensor<float>& broadCastSrcLocal,  const LocalTensor<float>& broadCastDstLocal, 
+template <typename DT, typename GT, typename GKT>
+__aicore__ inline void GDRBase<DT, GT, GKT>::BroadCastAndMul(const LocalTensor<float>& broadCastSrcLocal,  const LocalTensor<float>& broadCastDstLocal,
                                                     const LocalTensor<float>& mulSrcLocal, const uint32_t dim0, const uint32_t dim1) 
 {
     const uint32_t dstShape[] = {dim0, dim1};

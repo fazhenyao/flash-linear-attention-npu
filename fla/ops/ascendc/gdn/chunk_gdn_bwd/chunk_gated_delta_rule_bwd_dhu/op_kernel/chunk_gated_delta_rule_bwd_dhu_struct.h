@@ -21,6 +21,7 @@ namespace GDN {
 
 constexpr uint32_t CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY = 1;
 constexpr uint32_t CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY_G_FP32 = 2;
+constexpr uint32_t CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY_NO_G = 3;
 
 struct ChunkGatedDeltaRuleBwdDhuTilingData {
     uint64_t B;
@@ -43,6 +44,8 @@ struct ChunkGatedDeltaRuleBwdDhuTilingData {
     uint64_t qDoWs;
     uint64_t isVarLen;
     uint64_t isScale;
+    uint64_t hasG;
+    uint64_t hasGk;
     uint32_t usedCoreNum;
     float scale;
 };

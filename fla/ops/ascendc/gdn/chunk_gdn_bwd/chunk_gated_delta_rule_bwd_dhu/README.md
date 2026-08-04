@@ -61,7 +61,7 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdDhu(
 | `dO` | 输入 | 必选 | 前向输出 `o` 的梯度张量 | 即上游输出梯度 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, V]` | 支持 |
 | `dv` | 输入 | 必选 | Value 的上游梯度张量 | 将与来自 `dh` 的贡献叠加后输出为 `dv2` | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, V]` | 支持 |
 | `gOptional` | 输入 | 可选 | Gate 张量 | 对隐藏状态递推施加指数门控 `exp(g)` | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, HV, T]` | 支持 |
-| `gkOptional` | 输入 | 可选 | Key-wise Gate 张量 | 对每个 Key 维度施加额外门控 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, K]` | 支持 |
+| `gkOptional` | 输入 | 可选 | Key-wise Gate 张量 | 对每个 Key 维度施加额外门控 | `FLOAT` | `ND` | `[B, HV, T, K]` | 支持 |
 | `h0Optional` | 输入 | 可选 | 初始隐藏状态张量 | 提供时参与递推初始化 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, K, V]` | 支持 |
 | `dhtOptional` | 输入 | 可选 | 末尾隐藏状态的梯度张量 | 反向递推的起始梯度 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, K, V]` | 支持 |
 | `cuSeqlensOptional` | 输入 | 可选 | 变长序列的累计长度信息 | 变长模式输入，形状为 `[N+1]` | `INT64` | `ND` | 1 维 | - |
@@ -99,7 +99,8 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdDhu(
 - **GVA 约束**：`HV % HK == 0`；读 `q`/`k` 时使用 `hq = hv / (HV / HK)`，读/写 `w`/`dO`/`dv`/`g`/`dh`/`dv2` 使用 value head 索引 `hv`。
 - 当前实现要求 `K ≤ 128`。
 - 当前实现要求 `V ≤ 256`（Cube tile 原生按 `V` 上限 256 设计，**无**按 V 维切换的 TilingKey）。
-- **TilingKey**：`g` 与 `q` 同 dtype 时为 Key=1，`g` 为 FP32 时为 Key=2（与 V 维无关）。
+- **TilingKey**：`g` 与 `q` 同 dtype 时为 Key=1，`g` 为 FP32 时为 Key=2，`g=None` 时为 Key=3。
+  `gk` 在 Kernel 内固定为 FP32，是否存在由 `hasGk` 控制，不增加 TilingKey。
 - `chunkSize` 当前仅支持 `64` 或 `128`。
 - 当启用变长模式时，`cuSeqlensOptional` 和 `chunkIndicesOptional` 须同时提供，且仅支持 `B = 1`。
 
@@ -117,6 +118,11 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdDhu(
 - `gOptional`：
   - 数据类型可以为 `FLOAT16`、`BFLOAT16` 或 `FLOAT`
   - 数据类型需与 `q` 类型一致，或为 `FLOAT`（FP32）
+  - 可以省略；省略时 scalar gate 为恒等变换
+
+- `gkOptional`：
+  - 数据类型固定为 `FLOAT`（FP32）
+  - 仅在当前 chunk 的 `k @ b_dh` 计算完成后，对传递到前一 chunk 的 `b_dh` 沿 K 维施加门控
 
 ---
 
@@ -171,6 +177,8 @@ dh[:, :, i_t] = b_dh
 # 反向递推更新 b_dh（传递给上一 chunk）
 if g:
     b_dh *= exp(g_last)
+if gk:
+    b_dh *= exp(gk_last)[:, None]
 term1 = (q_chunk * exp(g_chunk))^T @ dO_chunk * scale
 term2 = w_chunk^T @ dv2_chunk
 b_dh = b_dh + term1 - term2

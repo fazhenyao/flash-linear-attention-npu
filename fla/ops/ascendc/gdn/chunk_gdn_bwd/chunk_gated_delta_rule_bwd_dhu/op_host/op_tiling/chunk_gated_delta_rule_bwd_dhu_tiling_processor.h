@@ -34,6 +34,7 @@ static constexpr size_t CHUNK_GDR_BWD_DHU_INPUT_W_IDX = 2;
 static constexpr size_t CHUNK_GDR_BWD_DHU_INPUT_DO_IDX = 3;
 static constexpr size_t CHUNK_GDR_BWD_DHU_INPUT_DV_IDX = 4;
 static constexpr size_t CHUNK_GDR_BWD_DHU_INPUT_G_IDX = 5;
+static constexpr size_t CHUNK_GDR_BWD_DHU_INPUT_GK_IDX = 6;
 
 static constexpr size_t CHUNK_GDR_BWD_DHU_DIM_0 = 0;
 static constexpr size_t CHUNK_GDR_BWD_DHU_DIM_1 = 1;
@@ -44,6 +45,7 @@ static constexpr uint32_t CHUNK_GDR_BWD_DHU_NUM_64 = 64;
 static constexpr uint32_t CHUNK_GDR_BWD_DHU_NUM_128 = 128;
 static constexpr uint32_t CHUNK_GDR_BWD_DHU_NUM_2 = 2;
 static constexpr uint32_t CHUNK_GDR_BWD_DHU_NUM_3 = 3;
+static constexpr uint32_t CHUNK_GDR_BWD_DHU_NUM_4 = 4;
 static constexpr uint32_t CHUNK_GDR_BWD_DHU_BLOCK_SIZE = 32;
 
 static constexpr uint32_t CHUNK_GDR_BWD_DHU_HALF_DTYPE_SIZE = 2;
@@ -55,6 +57,7 @@ static constexpr const char *const CHUNK_GDR_BWD_DHU_INPUT_W_NAME = "w";
 static constexpr const char *const CHUNK_GDR_BWD_DHU_INPUT_DO_NAME = "d_o";
 static constexpr const char *const CHUNK_GDR_BWD_DHU_INPUT_DV_NAME = "dv";
 static constexpr const char *const CHUNK_GDR_BWD_DHU_INPUT_G_NAME = "g";
+static constexpr const char *const CHUNK_GDR_BWD_DHU_INPUT_GK_NAME = "gk";
 static constexpr const char *const CHUNK_GDR_BWD_DHU_INPUT_CHUNK_INDICES_NAME = "chunk_indices";
 static constexpr const char *const CHUNK_GDR_BWD_DHU_INPUT_SEQLENS_NAME = "cu_seqlens";
 
@@ -66,11 +69,14 @@ struct ChunkGatedDeltaRuleBwdDhuTilingContext {
     const gert::StorageShape *doShape;
     const gert::StorageShape *dvShape;
     const gert::StorageShape *gShape;
+    const gert::StorageShape *gkShape;
     const gert::StorageShape *cuSeqlensShape;
     const gert::StorageShape *chunkIndicesShape;
     ge::DataType qDtype;
     ge::DataType gDtype;
+    ge::DataType gkDtype;
     bool hasG;
+    bool hasGk;
     bool hasScaleAttr;
     double scaleAttr;
     int32_t chunkSize;
@@ -140,6 +146,13 @@ public:
         const gert::Shape doShape = ctx_.doShape->GetStorageShape();
         const gert::Shape dvShape = ctx_.dvShape->GetStorageShape();
 
+        OP_CHECK_IF(qShape.GetDimNum() != CHUNK_GDR_BWD_DHU_NUM_4 ||
+                        kShape.GetDimNum() != CHUNK_GDR_BWD_DHU_NUM_4 ||
+                        wShape.GetDimNum() != CHUNK_GDR_BWD_DHU_NUM_4 ||
+                        doShape.GetDimNum() != CHUNK_GDR_BWD_DHU_NUM_4 ||
+                        dvShape.GetDimNum() != CHUNK_GDR_BWD_DHU_NUM_4,
+                    OP_LOGE(ctx_.nodeName, "q/k/w/dO/dv must all be rank 4."), return ge::GRAPH_FAILED);
+
         B_ = static_cast<uint64_t>(qShape.GetDim(CHUNK_GDR_BWD_DHU_DIM_0));
         Hk_ = static_cast<uint64_t>(qShape.GetDim(CHUNK_GDR_BWD_DHU_DIM_1));
         T_ = static_cast<uint64_t>(qShape.GetDim(CHUNK_GDR_BWD_DHU_DIM_2));
@@ -182,6 +195,23 @@ public:
                             "== 0; got Hk=%lu Hv=%lu.",
                             Hk_, Hv_),
                     return ge::GRAPH_FAILED);
+        if (ctx_.hasG) {
+            const gert::Shape gShape = ctx_.gShape->GetStorageShape();
+            OP_CHECK_IF(gShape.GetDimNum() != CHUNK_GDR_BWD_DHU_NUM_3 ||
+                            gShape.GetDim(CHUNK_GDR_BWD_DHU_DIM_0) != static_cast<int64_t>(B_) ||
+                            gShape.GetDim(CHUNK_GDR_BWD_DHU_DIM_1) != static_cast<int64_t>(Hv_) ||
+                            gShape.GetDim(CHUNK_GDR_BWD_DHU_DIM_2) != static_cast<int64_t>(T_),
+                        OP_LOGE(ctx_.nodeName, "g must be [B,Hv,T]."), return ge::GRAPH_FAILED);
+        }
+        if (ctx_.hasGk) {
+            const gert::Shape gkShape = ctx_.gkShape->GetStorageShape();
+            OP_CHECK_IF(gkShape.GetDimNum() != CHUNK_GDR_BWD_DHU_NUM_4 ||
+                            gkShape.GetDim(CHUNK_GDR_BWD_DHU_DIM_0) != static_cast<int64_t>(B_) ||
+                            gkShape.GetDim(CHUNK_GDR_BWD_DHU_DIM_1) != static_cast<int64_t>(Hv_) ||
+                            gkShape.GetDim(CHUNK_GDR_BWD_DHU_DIM_2) != static_cast<int64_t>(T_) ||
+                            gkShape.GetDim(CHUNK_GDR_BWD_DHU_DIM_3) != static_cast<int64_t>(K_),
+                        OP_LOGE(ctx_.nodeName, "gk must be [B,Hv,T,K]."), return ge::GRAPH_FAILED);
+        }
 
         const bool isScale = ctx_.hasScaleAttr;
         const float scale = isScale ? static_cast<float>(ctx_.scaleAttr) : 1.0f;
@@ -199,6 +229,8 @@ public:
         tiling_.isScale = isScale ? 1 : 0;
         tiling_.scale = scale;
         tiling_.chunkSize = chunkSize_;
+        tiling_.hasG = ctx_.hasG ? 1 : 0;
+        tiling_.hasGk = ctx_.hasGk ? 1 : 0;
         return ge::GRAPH_SUCCESS;
     }
 
@@ -240,20 +272,21 @@ public:
 
     ge::graphStatus CheckInputDtype()
     {
-        if (!ctx_.hasG) {
-            OP_LOGE(ctx_.nodeName, "Input g is required for chunk_gated_delta_rule_bwd_dhu kernel.");
-            return ge::GRAPH_FAILED;
-        }
         const ge::DataType qDtype = ctx_.qDtype;
-        const ge::DataType gDtype = ctx_.gDtype;
-        if (gDtype != qDtype && gDtype != ge::DT_FLOAT) {
-            OP_LOGE(ctx_.nodeName, "gDtype must be DT_FLOAT or as same as qDtype");
-            return ge::GRAPH_FAILED;
-        }
-        if (gDtype == ge::DT_FLOAT) {
-            tilingKey_ = GDN::CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY_G_FP32;
+        if (ctx_.hasG) {
+            const ge::DataType gDtype = ctx_.gDtype;
+            if (gDtype != qDtype && gDtype != ge::DT_FLOAT) {
+                OP_LOGE(ctx_.nodeName, "g dtype must be DT_FLOAT or the same as q dtype.");
+                return ge::GRAPH_FAILED;
+            }
+            tilingKey_ = gDtype == ge::DT_FLOAT ? GDN::CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY_G_FP32
+                                                : GDN::CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY;
         } else {
-            tilingKey_ = GDN::CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY;
+            tilingKey_ = GDN::CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY_NO_G;
+        }
+        if (ctx_.hasGk && ctx_.gkDtype != ge::DT_FLOAT) {
+            OP_LOGE(ctx_.nodeName, "gk dtype must be DT_FLOAT when gk is provided.");
+            return ge::GRAPH_FAILED;
         }
         return ge::GRAPH_SUCCESS;
     }

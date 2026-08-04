@@ -26,6 +26,7 @@ constexpr uint32_t INPUT_W_IDX = 2;
 constexpr uint32_t INPUT_DO_IDX = 3;
 constexpr uint32_t INPUT_DV_IDX = 4;
 constexpr uint32_t INPUT_G_IDX = 5;
+constexpr uint32_t INPUT_GK_IDX = 6;
 constexpr uint32_t INPUT_CU_SEQLENS_IDX = 9;
 constexpr uint32_t INPUT_CHUNK_INDICES_IDX = 10;
 
@@ -57,6 +58,8 @@ static void ChunkGatedDeltaRuleBwdDhuTilingDataPrint(gert::TilingContext *contex
     OP_LOGD(nodeName, "qDoWs is %lu.", tiling.qDoWs);
     OP_LOGD(nodeName, "isVarLen is %lu.", tiling.isVarLen);
     OP_LOGD(nodeName, "isScale is %lu.", tiling.isScale);
+    OP_LOGD(nodeName, "hasG is %lu.", tiling.hasG);
+    OP_LOGD(nodeName, "hasGk is %lu.", tiling.hasGk);
     OP_LOGD(nodeName, "usedCoreNum is %u.", tiling.usedCoreNum);
     OP_LOGD(nodeName, "scale is %f.", tiling.scale);
 }
@@ -81,6 +84,7 @@ ASCENDC_EXTERN_C ge::graphStatus Tiling4ChunkGDRBwdDhu(gert::TilingContext *cont
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, maxUbSize);
 
     const auto gInputDesc = context->GetOptionalInputDesc(INPUT_G_IDX);
+    const auto gkInputDesc = context->GetOptionalInputDesc(INPUT_GK_IDX);
     const auto qInputDesc = context->GetInputDesc(INPUT_Q_IDX);
     OP_CHECK_NULL_WITH_CONTEXT(context, qInputDesc);
 
@@ -89,6 +93,12 @@ ASCENDC_EXTERN_C ge::graphStatus Tiling4ChunkGDRBwdDhu(gert::TilingContext *cont
     if (context->GetOptionalInputShape(INPUT_G_IDX) != nullptr) {
         gShape = *context->GetOptionalInputShape(INPUT_G_IDX);
         gShapePtr = &gShape;
+    }
+    const gert::StorageShape *gkShapePtr = nullptr;
+    gert::StorageShape gkShape;
+    if (context->GetOptionalInputShape(INPUT_GK_IDX) != nullptr) {
+        gkShape = *context->GetOptionalInputShape(INPUT_GK_IDX);
+        gkShapePtr = &gkShape;
     }
 
     ChunkGatedDeltaRuleBwdDhuTilingContext ctx{
@@ -99,11 +109,14 @@ ASCENDC_EXTERN_C ge::graphStatus Tiling4ChunkGDRBwdDhu(gert::TilingContext *cont
         context->GetInputShape(INPUT_DO_IDX),
         context->GetInputShape(INPUT_DV_IDX),
         gShapePtr,
+        gkShapePtr,
         context->GetOptionalInputShape(INPUT_CU_SEQLENS_IDX),
         context->GetOptionalInputShape(INPUT_CHUNK_INDICES_IDX),
         qInputDesc->GetDataType(),
         gInputDesc != nullptr ? gInputDesc->GetDataType() : ge::DT_FLOAT,
+        gkInputDesc != nullptr ? gkInputDesc->GetDataType() : ge::DT_FLOAT,
         gShapePtr != nullptr,
+        gkShapePtr != nullptr,
         scalePtr != nullptr,
         scalePtr != nullptr ? *scalePtr : 1.0,
         chunkSizePtr != nullptr ? static_cast<int32_t>(*chunkSizePtr) : static_cast<int32_t>(64),

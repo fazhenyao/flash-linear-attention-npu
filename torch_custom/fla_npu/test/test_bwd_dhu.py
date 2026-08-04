@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 from typing import List, Optional, Tuple
 
@@ -44,9 +45,11 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
     cu_seqlens: Optional[List[int]] = None,
     chunk_indices: Optional[List[int]] = None,
     g: Optional[torch.Tensor] = None,
+    gk: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     chunk_size: int = 64,
     golden_mode: str = "fp32",
+    use_exp2: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """GVA 形状 CPU 标杆。golden_mode: fp64 / npu / fp32。"""
     dtype_ = q.dtype
@@ -92,6 +95,8 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
         dv = dv.to(dtype_)
         if g is not None:
             g = g.float()
+        if gk is not None:
+            gk = gk.float()
     else:
         q = q.to(compute_dtype)
         k = k.to(compute_dtype)
@@ -100,6 +105,15 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
         dv = dv.to(compute_dtype)
         if g is not None:
             g = g.to(compute_dtype)
+        if gk is not None:
+            gk = gk.to(compute_dtype)
+
+    if use_exp2:
+        ln2 = math.log(2.0)
+        if g is not None:
+            g = g * ln2
+        if gk is not None:
+            gk = gk * ln2
 
     def _mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         if elem_dtype is None:
@@ -115,6 +129,9 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
         if elem_dtype is None:
             return x.to(compute_dtype)
         return _round_elem(x, elem_dtype)
+
+    def _to_gate_compute(x: torch.Tensor) -> torch.Tensor:
+        return x.to(torch.float64 if golden_mode == "fp64" else torch.float32)
 
     chunk_info = []
     for i_t in range(NT):
@@ -166,8 +183,8 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
 
             b_dv = _mm(k_blk, b_dh)
             if g is not None:
-                bg_last = g[:, :, global_last_idx].to(torch.float32)
-                b_g = g[:, :, gs:ge].to(torch.float32)
+                bg_last = _to_gate_compute(g[:, :, global_last_idx])
+                b_g = _to_gate_compute(g[:, :, gs:ge])
                 gate_factor = torch.exp(bg_last.unsqueeze(-1) - b_g).unsqueeze(-1)
                 m_t = torch.arange(block_size_t, device=device, dtype=torch.float32) < float(block_size_t)
                 b_dv = b_dv * gate_factor * m_t.view(1, 1, block_size_t, 1)
@@ -185,6 +202,9 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
             else:
                 b_dh_for_update = b_dh.clone()
                 b_q_gated = b_q_t
+            if gk is not None:
+                gk_last = _to_gate_compute(gk[:, :, global_last_idx, :])
+                b_dh_for_update = b_dh_for_update * torch.exp(gk_last).unsqueeze(-1)
 
             term1 = _mm(b_q_gated, b_do) * scale_f
             term2 = _mm(b_w_t, b_dv)
@@ -211,8 +231,8 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
                     b_dv = _mm(b_k, b_dh)
 
                     if g is not None:
-                        bg_last = g[b, i_h, global_last_idx].to(torch.float32)
-                        b_g = g[b, i_h, gs:ge].to(torch.float32)
+                        bg_last = _to_gate_compute(g[b, i_h, global_last_idx])
+                        b_g = _to_gate_compute(g[b, i_h, gs:ge])
                         bg_last_exp = torch.exp(bg_last)
                         b_g_exp = torch.exp(b_g)
                         m_t = torch.arange(block_size_t, device=device) < block_size_t
@@ -233,6 +253,9 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
                         b_q_gated = b_q_t * b_g_exp.unsqueeze(0)
                     else:
                         b_q_gated = b_q_t
+                    if gk is not None:
+                        gk_last = _to_gate_compute(gk[b, i_h, global_last_idx, :])
+                        b_dh_for_update = b_dh_for_update * torch.exp(gk_last).unsqueeze(-1)
 
                     term1 = _mm(b_q_gated, b_do) * scale_f
                     term2 = _mm(b_w_t, b_dv)
