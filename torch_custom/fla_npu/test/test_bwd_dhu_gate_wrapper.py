@@ -1,4 +1,3 @@
-import math
 import unittest
 from unittest import mock
 
@@ -47,15 +46,20 @@ class BwdDhuGateWrapperTest(unittest.TestCase):
         self.assertEqual(captured["args"][6].dtype, torch.float32)
         torch.testing.assert_close(captured["args"][6], torch.ones_like(gk, dtype=torch.float32))
 
-    def test_use_exp2_converts_both_gates_in_fp32(self):
+    def test_use_exp2_is_compatibility_only(self):
         g = torch.ones((1, 1, 64), dtype=torch.float16)
         gk = torch.ones((1, 1, 64, 64), dtype=torch.float32)
-        captured = self._call(g=g, gk=gk, use_exp2=True)
-        expected = math.log(2.0)
-        self.assertEqual(captured["args"][5].dtype, torch.float32)
-        self.assertEqual(captured["args"][6].dtype, torch.float32)
-        torch.testing.assert_close(captured["args"][5], torch.full_like(g, expected, dtype=torch.float32))
-        torch.testing.assert_close(captured["args"][6], torch.full_like(gk, expected))
+        captured_false = self._call(g=g, gk=gk, use_exp2=False)
+        captured_true = self._call(g=g, gk=gk, use_exp2=True)
+
+        for captured in (captured_false, captured_true):
+            self.assertEqual(captured["args"][5].dtype, torch.float16)
+            self.assertEqual(captured["args"][6].dtype, torch.float32)
+            torch.testing.assert_close(captured["args"][5], g)
+            torch.testing.assert_close(captured["args"][6], gk)
+
+        torch.testing.assert_close(captured_false["args"][5], captured_true["args"][5])
+        torch.testing.assert_close(captured_false["args"][6], captured_true["args"][6])
 
 
 if __name__ == "__main__":

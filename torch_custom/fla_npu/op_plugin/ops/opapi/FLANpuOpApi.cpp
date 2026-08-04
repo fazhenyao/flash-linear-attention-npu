@@ -287,23 +287,14 @@ bool ResolveChunkLocalCumsumOutputDtype(
             " chunk_num=", chunk_num);
     }
 
-    at::Tensor gKernel = g_;
     at::Tensor gKKernel = gK_.defined() ? gK_.to(at::kFloat) : gK_;
-    if (use_exp2.value_or(false)) {
-        constexpr double LN2 = 0.6931471805599453;
-        if (g_.defined()) {
-            gKernel = g_.to(at::kFloat) * LN2;
-        }
-        if (gK_.defined()) {
-            gKKernel = gKKernel * LN2;
-        }
-    }
+    (void)use_exp2; // Compatibility-only: the kernel now always applies exp2 gate semantics.
 
     // 调用ACLNN算子
     EXEC_NPU_CMD_EXT(
         aclnnChunkGatedDeltaRuleBwdDhu,
         q, k, w, d_o, dv,
-        gKernel, gKKernel, h0_, dht_,
+        g_, gKKernel, h0_, dht_,
         cu_seqlens, chunk_indices,
         scale, chunk_size,
         dh, dh0, dv2

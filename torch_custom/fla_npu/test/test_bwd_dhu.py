@@ -108,12 +108,14 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
         if gk is not None:
             gk = gk.to(compute_dtype)
 
-    if use_exp2:
-        ln2 = math.log(2.0)
-        if g is not None:
-            g = g * ln2
-        if gk is not None:
-            gk = gk * ln2
+    # Gate inputs are always in the log2 domain. ``use_exp2`` is retained only
+    # for source compatibility and no longer changes numerical semantics.
+    del use_exp2
+    ln2 = math.log(2.0)
+    if g is not None:
+        g = g * ln2
+    if gk is not None:
+        gk = gk * ln2
 
     def _mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         if elem_dtype is None:

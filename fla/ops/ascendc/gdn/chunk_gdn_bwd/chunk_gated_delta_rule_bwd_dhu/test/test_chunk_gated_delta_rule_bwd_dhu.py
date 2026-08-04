@@ -289,6 +289,12 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
     if scale is None:
         scale = 1.0
 
+    # The operator always interprets Gate inputs in the log2 domain. Convert
+    # once here because the reference below uses torch.exp throughout.
+    ln2 = math.log(2.0)
+    g = g.float() * ln2 if g is not None else None
+    gk = gk.float() * ln2 if gk is not None else None
+
     chunk_info = []
     for i_t in range(NT):
         if cu_seqlens is not None:
@@ -533,15 +539,8 @@ def test_fix_gate_combination(
     gk = torch.linspace(-0.02, -0.001, T * K, dtype=torch.float32).reshape(1, 1, T, K)
     gk = gk.expand(B, Hv, T, K).contiguous() if use_gk else None
 
-    golden_g = g
-    golden_gk = gk
-    if use_exp2:
-        ln2 = math.log(2.0)
-        golden_g = g.float() * ln2 if g is not None else None
-        golden_gk = gk.float() * ln2 if gk is not None else None
-
     dh_golden, _, dv2_golden = chunk_gated_delta_rule_bwd_dhu_torch(
-        q, k, w, d_o, dv, g=golden_g, gk=golden_gk, scale=scale, chunk_size=chunk_size
+        q, k, w, d_o, dv, g=g, gk=gk, scale=scale, chunk_size=chunk_size
     )
     dh_npu, _, dv2_npu = torch.ops.npu.npu_chunk_gated_delta_rule_bwd_dhu(
         q.npu(), k.npu(), w.npu(), d_o.npu(), dv.npu(),
@@ -648,6 +647,8 @@ if __name__ == "__main__":
     test_fix_gate_combination(use_g=False, use_gk=False)
     test_fix_gate_combination(use_g=True, use_gk=False)
     test_fix_gate_combination(use_g=False, use_gk=True)
+    # use_exp2 is compatibility-only; both values match the same exp2 golden.
+    test_fix_gate_combination(use_g=True, use_gk=True, use_exp2=False)
     test_fix_gate_combination(use_g=True, use_gk=True, use_exp2=True)
     # GVA varlen smoke
     test_variable(B=1, Hk=4, Hv=8, T=512, K=128, V=128, chunk_size=64, scale=0.011, cu_seqlens_len=4, ktype=torch.bfloat16, gtype=torch.bfloat16)

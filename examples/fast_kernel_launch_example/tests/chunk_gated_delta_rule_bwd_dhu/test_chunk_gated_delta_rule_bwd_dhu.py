@@ -161,6 +161,9 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
     if scale is None:
         scale = 1.0
 
+    # ChunkGatedDeltaRuleBwdDhu always interprets Gate inputs in the log2 domain.
+    g = g.float() * math.log(2.0) if g is not None else None
+
     chunk_info = []
     for i_t in range(NT):
         if cu_seqlens is not None:

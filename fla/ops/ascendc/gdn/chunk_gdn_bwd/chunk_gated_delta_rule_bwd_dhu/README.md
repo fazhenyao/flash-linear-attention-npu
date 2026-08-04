@@ -60,7 +60,7 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdDhu(
 | `w` | 输入 | 必选 | Weight（衰减权重）输入张量 | 参与隐藏状态更新 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, K]` | 支持 |
 | `dO` | 输入 | 必选 | 前向输出 `o` 的梯度张量 | 即上游输出梯度 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, V]` | 支持 |
 | `dv` | 输入 | 必选 | Value 的上游梯度张量 | 将与来自 `dh` 的贡献叠加后输出为 `dv2` | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, V]` | 支持 |
-| `gOptional` | 输入 | 可选 | Gate 张量 | 对隐藏状态递推施加指数门控 `exp(g)` | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, HV, T]` | 支持 |
+| `gOptional` | 输入 | 可选 | log2 域 Gate 张量 | 对隐藏状态递推施加指数门控 `exp2(g)` | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, HV, T]` | 支持 |
 | `gkOptional` | 输入 | 可选 | Key-wise Gate 张量 | 对每个 Key 维度施加额外门控 | `FLOAT` | `ND` | `[B, HV, T, K]` | 支持 |
 | `h0Optional` | 输入 | 可选 | 初始隐藏状态张量 | 提供时参与递推初始化 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, K, V]` | 支持 |
 | `dhtOptional` | 输入 | 可选 | 末尾隐藏状态的梯度张量 | 反向递推的起始梯度 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, K, V]` | 支持 |
@@ -118,10 +118,12 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdDhu(
 - `gOptional`：
   - 数据类型可以为 `FLOAT16`、`BFLOAT16` 或 `FLOAT`
   - 数据类型需与 `q` 类型一致，或为 `FLOAT`（FP32）
+  - 数值按 log2 域解释，即门控函数为 `exp2(g)`
   - 可以省略；省略时 scalar gate 为恒等变换
 
 - `gkOptional`：
   - 数据类型固定为 `FLOAT`（FP32）
+  - 数值按 log2 域解释，即门控函数为 `exp2(gk)`
   - 仅在当前 chunk 的 `k @ b_dh` 计算完成后，对传递到前一 chunk 的 `b_dh` 沿 K 维施加门控
 
 ---
@@ -162,13 +164,22 @@ B = 1
 
 ### 4.4 数值语义
 
+所有入口（包括 raw aclnn、稳定 Python 入口和 legacy `torch.ops.npu`）均将 `g/gk` 解释为 log2 域 Gate：
+
+```text
+gate(x) = exp2(x) = exp(x * ln(2))
+```
+
+Kernel 在 AIV 的 FP32 UB 中固定执行 `*ln(2)` 后调用 `Exp`。Python 参数 `use_exp2` 为源码兼容而保留，
+其默认值、名称和位置均不变，但 `True` 与 `False` 不再切换 Gate 数值域，计算结果相同。
+
 算子对 chunk 进行**反向时间扫描**（从最后一个 chunk 到第一个 chunk），每个 chunk 内执行：
 
 ```text
 # dv2：叠加来自隐藏状态的 Value 梯度
 b_dv  = k_chunk @ b_dh                        # 从当前 dh 产生的 dv 贡献
 if g:
-    b_dv *= exp(g_last - g_chunk)[:, None]     # 门控衰减
+    b_dv *= exp2(g_last - g_chunk)[:, None]    # 门控衰减
 dv2_chunk = b_dv + dv_chunk                   # 与上游 dv 叠加
 
 # dh 存储（在更新前记录当前 chunk 的 dh）
@@ -176,10 +187,10 @@ dh[:, :, i_t] = b_dh
 
 # 反向递推更新 b_dh（传递给上一 chunk）
 if g:
-    b_dh *= exp(g_last)
+    b_dh *= exp2(g_last)
 if gk:
-    b_dh *= exp(gk_last)[:, None]
-term1 = (q_chunk * exp(g_chunk))^T @ dO_chunk * scale
+    b_dh *= exp2(gk_last)[:, None]
+term1 = (q_chunk * exp2(g_chunk))^T @ dO_chunk * scale
 term2 = w_chunk^T @ dv2_chunk
 b_dh = b_dh + term1 - term2
 ```
@@ -224,7 +235,7 @@ def test_chunk_gated_delta_rule_bwd_dhu_fix():
         dht=None,
         cu_seqlens=None,
         chunk_indices=None,
-        use_exp2=False,
+        use_exp2=False,  # 兼容保留；True/False 均采用 exp2 Gate 语义
         transpose_state_layout=False
     )
 
@@ -309,7 +320,7 @@ def test_chunk_gated_delta_rule_bwd_dhu_varlen():
         dht=None,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        use_exp2=False,
+        use_exp2=False,  # 兼容保留；True/False 均采用 exp2 Gate 语义
         transpose_state_layout=False
     )
 

@@ -303,6 +303,7 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::CalcGatedQ(float& gLast, float& gLas
             } else {
                 CopyIn(this->gCastLocal, this->gLocal, this->gGm[gLastOffset], 1);
             }
+            Muls(this->gCastLocal, this->gCastLocal, GATE_LN2, 1);
             Exp(this->gExpLocal, this->gCastLocal, 1);
             gLast = this->gCastLocal.GetValue(0);
             gLastExp = this->gExpLocal.GetValue(0);
@@ -320,11 +321,13 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::CalcGatedQ(float& gLast, float& gLas
         if constexpr (std::is_same<GT, float>::value) {
             if (this->subBlockIdx == 0) {
                 CopyIn(this->gCastLocal, this->gCastLocal, this->gGm[gmOffsetG_ + bos_], this->curBT, false);
+                Muls(this->gCastLocal, this->gCastLocal, GATE_LN2, this->curBT);
                 Exp(this->gExpLocal, this->gCastLocal, this->curBT);
                 gLast = this->gCastLocal.GetValue(static_cast<uint64_t>(this->curBT - 1));
                 gLastExp = this->gExpLocal.GetValue(static_cast<uint64_t>(this->curBT - 1));
             } else {
                 CopyIn(this->gCastLocal, this->gCastLocal, this->gGm[gmOffsetG_ + bos_], this->curCalcBT, false);
+                Muls(this->gCastLocal, this->gCastLocal, GATE_LN2, this->curCalcBT);
                 Exp(this->gExpLocal, this->gCastLocal, this->curCalcBT);
                 gLast = this->gCastLocal.GetValue(this->curCalcBT - 1);
                 gLastExp = this->gExpLocal.GetValue(this->curCalcBT - 1);
@@ -332,11 +335,13 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::CalcGatedQ(float& gLast, float& gLas
         } else {
             if (this->subBlockIdx == 0) {
                 CopyIn(this->gCastLocal, this->gLocal, this->gGm[gmOffsetG_ + bos_], this->curBT);
+                Muls(this->gCastLocal, this->gCastLocal, GATE_LN2, this->curBT);
                 Exp(this->gExpLocal, this->gCastLocal, this->curBT);
                 gLast = this->gCastLocal.GetValue(static_cast<uint64_t>(this->curBT - 1));
                 gLastExp = this->gExpLocal.GetValue(static_cast<uint64_t>(this->curBT - 1));
             } else {
                 CopyIn(this->gCastLocal, this->gLocal, this->gGm[gmOffsetG_ + bos_], this->curCalcBT);
+                Muls(this->gCastLocal, this->gCastLocal, GATE_LN2, this->curCalcBT);
                 Exp(this->gExpLocal, this->gCastLocal, this->curCalcBT);
                 gLast = this->gCastLocal.GetValue(this->curCalcBT - 1);
                 gLastExp = this->gExpLocal.GetValue(this->curCalcBT - 1);
@@ -405,6 +410,7 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::UpdateDh(const float gLastExp, uint6
             // FP32 block of every [halfK, V] bdh tile (global K rows 0/halfK, V columns 0:64).
             const uint64_t gkLastOffset = gmOffsetGk_ + (bos_ + this->curBT - 1) * this->K;
             CopyIn(this->gCastLocal, this->gCastLocal, this->gkGm[gkLastOffset], this->halfK, false);
+            Muls(this->gCastLocal, this->gCastLocal, GATE_LN2, this->halfK);
             Exp(this->gCastLocal, this->gCastLocal, this->halfK);
             uint8_t repeatTimes = Ceil(this->halfK, FP32_PER_BLOCK);
             Brcb(this->qdoCastLocal, this->gCastLocal, repeatTimes, {1,FP32_PER_BLOCK});

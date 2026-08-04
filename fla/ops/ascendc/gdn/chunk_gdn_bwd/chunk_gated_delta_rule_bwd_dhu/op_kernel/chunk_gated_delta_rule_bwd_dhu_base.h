@@ -29,6 +29,7 @@ constexpr uint64_t HALF_DTYPE_SIZE = 2;
 constexpr uint64_t FLOAT_DTYPE_SIZE = 4;
 constexpr uint64_t FP32_PER_BLOCK = 8;
 constexpr uint64_t FP32_PER_REPEAT = 64;
+constexpr float GATE_LN2 = 0.6931471805599453f;
 constexpr uint32_t BLOCK_SIZE = 32;
 constexpr uint32_t EVENT_V_MTE2 = 1;
 constexpr uint32_t EVENT_MTE2_V = 1;

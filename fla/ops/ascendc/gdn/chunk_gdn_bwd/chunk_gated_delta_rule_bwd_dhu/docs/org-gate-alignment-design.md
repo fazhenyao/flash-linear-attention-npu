@@ -1,15 +1,19 @@
-# ChunkGatedDeltaRuleBwdDhu 与上游 Triton Gate 语义对齐方案
+# 第一阶段：ChunkGatedDeltaRuleBwdDhu 与上游 Triton Gate 语义对齐方案
+
+> 阶段归档：本文整体归属于 `ChunkGatedDeltaRuleBwdDhu` 上游对齐工作的**第一阶段**。
+> 第一阶段只完成 Gate 数值域、`g=None`、`gk` 和对应 TilingKey 的语义与实现对齐；后续功能及性能优化
+> 另行进入第二阶段及后续阶段，不扩展本文范围。
 
 ## 1. 背景与目标
 
 本文给出 NPU 仓库 `ChunkGatedDeltaRuleBwdDhu` 与上游 `flash-linear-attention` 仓库
-`chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64` 的阶段性对齐方案。本阶段只处理以下差异：
+`chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64` 的第一阶段对齐方案。第一阶段只处理以下差异：
 
 - `g` 的数值域：上游 kernel 使用 `exp2`，当前 Ascend C kernel 使用自然指数 `exp`。
 - 支持 `g=None`。
 - 实现已有可选输入 `gk` 的 key-wise gate 语义。
 
-本方案暂不处理 `dht`、`dh0`、`h0` 和 `state_v_first`。对齐验证继续限定：
+第一阶段暂不处理 `dht`、`dh0`、`h0` 和 `state_v_first`。对齐验证继续限定：
 
 ```text
 h0=None
@@ -23,6 +27,25 @@ state_v_first=False
 - `aclnnChunkGatedDeltaRuleBwdDhu*` 接口。
 - `fla_npu.ops.ascendc.chunk_gated_delta_rule_bwd_dhu` 接口。
 - legacy `torch.ops.npu.npu_chunk_gated_delta_rule_bwd_dhu` schema。
+
+### 1.1 第一阶段交付边界
+
+第一阶段交付内容固定为：
+
+```text
+1. Gate 数值域：通过已有 use_exp2 参数完成 exp2 -> exp 域转换。
+2. Optional scalar gate：支持 g=None。
+3. Key-wise gate：支持 gk，Kernel 内固定按 FP32 处理。
+4. TilingKey：修正为 3 个，仅区分 g 的存在性和 dtype。
+5. 验证：覆盖 g/gk 四种组合、dense/varlen、关键 shape 和 dtype。
+```
+
+以下内容不属于第一阶段，若继续实施应新建设计文档并归入第二阶段或后续阶段：
+
+- `dht`、`dh0`、`h0` 和 `state_v_first` 语义对齐。
+- no-g 路径绕过 gated-Q workspace 等专用性能优化。
+- 根据 profiling 结果增加 `gk=None` 专用 TilingKey。
+- AIC/AIV 任务划分、流水或 UB 规划的进一步重构。
 
 ## 2. 目标数学语义
 
@@ -206,7 +229,7 @@ if hasG:
 bdh += term1 * scale - term2
 ```
 
-本阶段仍限定 `dht=None`，因此最后一个 chunk 的 `bdh` 为零，现有 `dv2[last] = dv[last]` 快速路径仍成立。
+第一阶段仍限定 `dht=None`，因此最后一个 chunk 的 `bdh` 为零，现有 `dv2[last] = dv[last]` 快速路径仍成立。
 
 ## 5. `gk` 支持方案
 
@@ -332,9 +355,9 @@ use_exp2=False 保持原自然指数域行为
 use_exp2=True 启用与上游 kernel 的 log2 域对齐
 ```
 
-## 7. 实施步骤
+## 7. 第一阶段实施步骤
 
-### 阶段一：支持 `g=None`
+### 任务一：支持 `g=None`
 
 1. tiling data 增加 `hasG`，允许 optional `g` 缺失。
 2. 增加 no-g tiling key。
@@ -342,7 +365,7 @@ use_exp2=True 启用与上游 kernel 的 log2 域对齐
 4. `CalcDv2` 和 `UpdateDh` 跳过 scalar gate 运算。
 5. 保留现有 AIC/AIV flag 和 workspace 协议。
 
-### 阶段二：支持 `gk`
+### 任务二：支持 `gk`
 
 1. tiling data 增加 `hasGk`，并校验存在的 `gk` 固定为 FP32。
 2. 将 TilingKey 扩展为 3 种 `g` 存在性/dtype 组合，所有 key 的 `GKT` 固定为 `float`。
@@ -352,14 +375,14 @@ use_exp2=True 启用与上游 kernel 的 log2 域对齐
 6. 在 `UpdateDh` 中应用 key-wise gate。
 7. 重新核算 UB 峰值。
 
-### 阶段三：激活 `use_exp2`
+### 任务三：激活 `use_exp2`
 
 1. ctypes wrapper 在 `use_exp2=True` 时将 `g/gk` 乘 `ln(2)`。
 2. legacy wrapper 实现相同转换。
 3. 保证转换后的 `g/gk` 使用 FP32 tensor 进入对应 FP32 tiling key。
 4. 更新 README、aclnn 文档和调用示例。
 
-## 8. 验证方案
+## 8. 第一阶段验证方案
 
 ### 8.1 与上游 kernel 对齐
 
@@ -428,7 +451,7 @@ Shape 与模式至少覆盖：
 - varlen 尾 chunk 和 dense 尾 chunk 正确。
 - A2、A3、A5 目标按风险执行单算子回归。
 
-## 9. 风险与边界
+## 9. 第一阶段风险与边界
 
 - 本方案只对齐 gate 语义；非零 `dht`、`dh0`、`h0` 和 `state_v_first` 仍不在支持范围内。
 - `use_exp2=True` 的转换必须同时覆盖 `g` 和 `gk`，否则组合 gate 的数值域不一致。
@@ -436,9 +459,9 @@ Shape 与模式至少覆盖：
 - no-g 路径继续经过 gated-Q workspace，第一版以降低实现风险为优先；如 profiling 证明复制开销显著，可另行设计 Cube 直读 q 的专用 tiling key。
 - `gk` 必须在 `k @ bdh` 之后应用，这是与上游语义对齐的正确性红线。
 
-## 10. 结论
+## 10. 第一阶段结论
 
-本方案在保持既有 ABI 和默认行为的前提下，将 Ascend C kernel 内部统一为自然指数域：
+第一阶段方案在保持既有 ABI 和默认行为的前提下，将 Ascend C kernel 内部统一为自然指数域：
 
 ```text
 kernel: 始终执行 exp
@@ -449,5 +472,6 @@ gk: 仅在 UpdateDh 阶段沿 K 维衰减 bdh
 TilingKey: 3 种组合，仅区分 g 的 None、q dtype 和 FP32；gk 固定为 FP32 并由 hasGk 区分是否存在
 ```
 
-完成后，NPU 算子可在本文限定范围内覆盖上游 kernel 的四种 `g/gk` 组合，同时不修改已发布的算子
-prototype、aclnn ABI 和 Python 参数列表。
+第一阶段完成后，NPU 算子可在本文限定范围内覆盖上游 kernel 的四种 `g/gk` 组合，同时不修改已发布的
+算子 prototype、aclnn ABI 和 Python 参数列表。本文到此封版为第一阶段设计基线；第二阶段及后续阶段不得
+直接扩大本文的交付范围。
