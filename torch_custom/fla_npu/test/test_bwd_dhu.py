@@ -46,6 +46,8 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
     chunk_indices: Optional[List[int]] = None,
     g: Optional[torch.Tensor] = None,
     gk: Optional[torch.Tensor] = None,
+    h0: Optional[torch.Tensor] = None,
+    dht: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     chunk_size: int = 64,
     golden_mode: str = "fp32",
@@ -97,6 +99,8 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
             g = g.float()
         if gk is not None:
             gk = gk.float()
+        if dht is not None:
+            dht = dht.float()
     else:
         q = q.to(compute_dtype)
         k = k.to(compute_dtype)
@@ -107,6 +111,8 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
             g = g.to(compute_dtype)
         if gk is not None:
             gk = gk.to(compute_dtype)
+        if dht is not None:
+            dht = dht.to(compute_dtype)
 
     # Gate inputs are always in the log2 domain. ``use_exp2`` is retained only
     # for source compatibility and no longer changes numerical semantics.
@@ -163,11 +169,14 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
         })
 
     dh = torch.zeros(B, Hv, NT, K, V, device=device, dtype=compute_dtype)
+    state_num = len(cu_seqlens) - 1 if cu_seqlens is not None else B
+    dh0 = torch.empty(state_num, Hv, K, V, device=device, dtype=compute_dtype) if h0 is not None else None
     dv2 = dv.clone() if cu_seqlens is not None else torch.zeros(B, Hv, T, V, device=device, dtype=dtype_)
 
     if cu_seqlens is None:
         hq = torch.arange(Hv, device=device, dtype=torch.long) // hv_per_hk
-        b_dh = torch.zeros(B, Hv, K, V, device=device, dtype=compute_dtype)
+        b_dh = (dht.to(compute_dtype).clone() if dht is not None else
+                torch.zeros(B, Hv, K, V, device=device, dtype=compute_dtype))
         for i_t in range(NT - 1, -1, -1):
             info = chunk_info[i_t]
             gs, ge = info["global_start_t"], info["global_end_t"]
@@ -211,12 +220,18 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
             term1 = _mm(b_q_gated, b_do) * scale_f
             term2 = _mm(b_w_t, b_dv)
             b_dh = _store(b_dh_for_update + term1 - term2)
+        if dh0 is not None:
+            dh0.copy_(b_dh)
     else:
         for b in range(B):
             for i_h in range(Hv):
                 hq = i_h // hv_per_hk
                 num_tokens = len(cu_seqlens) - 1
-                b_dh_buffers = {i_n: torch.zeros(K, V, device=device, dtype=compute_dtype) for i_n in range(num_tokens)}
+                b_dh_buffers = {
+                    i_n: (dht[i_n, i_h].to(compute_dtype).clone() if dht is not None else
+                          torch.zeros(K, V, device=device, dtype=compute_dtype))
+                    for i_n in range(num_tokens)
+                }
                 for i_t in range(NT - 1, -1, -1):
                     info = chunk_info[i_t]
                     i_n = info["i_n"]
@@ -263,4 +278,8 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
                     term2 = _mm(b_w_t, b_dv)
                     b_dh_buffers[i_n] = _store(b_dh_for_update + term1 - term2)
 
-    return dh, None, dv2
+                if dh0 is not None:
+                    for i_n in range(num_tokens):
+                        dh0[i_n, i_h] = b_dh_buffers[i_n]
+
+    return dh, dh0, dv2

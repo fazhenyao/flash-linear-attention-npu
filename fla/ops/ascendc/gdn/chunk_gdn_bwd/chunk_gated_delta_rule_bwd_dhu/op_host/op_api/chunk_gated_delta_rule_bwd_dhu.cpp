@@ -63,7 +63,7 @@ const std::array<const aclTensor *, 3> ChunkGatedDeltaRuleBwdDhu(
     if (dh0Out == nullptr) {
         op::Shape zeroShape;
         zeroShape.AppendDim(0);
-        dh0OutKernel = executor->AllocTensor(zeroShape, q->GetDataType(), op::Format::FORMAT_ND);
+        dh0OutKernel = executor->AllocTensor(zeroShape, op::DataType::DT_FLOAT, op::Format::FORMAT_ND);
     } else {
         dh0OutKernel = dh0Out;
     }
@@ -76,9 +76,25 @@ const std::array<const aclTensor *, 3> ChunkGatedDeltaRuleBwdDhu(
             return {nullptr, nullptr, nullptr};
         }
     }
+    const aclTensor *h0Kernel = h0Optional;
+    if (h0Kernel != nullptr && h0Kernel->GetDataType() != op::DataType::DT_FLOAT) {
+        h0Kernel = l0op::Cast(h0Kernel, op::DataType::DT_FLOAT, executor);
+        if (h0Kernel == nullptr) {
+            OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "Cast h0Optional to FP32 failed.");
+            return {nullptr, nullptr, nullptr};
+        }
+    }
+    const aclTensor *dhtKernel = dhtOptional;
+    if (dhtKernel != nullptr && dhtKernel->GetDataType() != op::DataType::DT_FLOAT) {
+        dhtKernel = l0op::Cast(dhtKernel, op::DataType::DT_FLOAT, executor);
+        if (dhtKernel == nullptr) {
+            OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "Cast dhtOptional to FP32 failed.");
+            return {nullptr, nullptr, nullptr};
+        }
+    }
 
     auto ret = ADD_TO_LAUNCHER_LIST_AICORE(ChunkGatedDeltaRuleBwdDhu,
-        OP_INPUT(q, k, w, dO, dv, gOptional, gkKernel, h0Optional, dhtOptional, actualCuSeqQLen, actualChunkIndices),
+        OP_INPUT(q, k, w, dO, dv, gOptional, gkKernel, h0Kernel, dhtKernel, actualCuSeqQLen, actualChunkIndices),
         OP_OUTPUT(dhOut, dh0OutKernel, dv2Out),
         OP_ATTR(scale, chunkSize));
     if (ret != ACLNN_SUCCESS) {

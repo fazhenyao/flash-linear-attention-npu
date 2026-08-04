@@ -73,6 +73,27 @@ static aclnnStatus CheckFormat(ChunkGatedDeltaRuleBwdDhuParams params)
 
 static aclnnStatus CheckShape(ChunkGatedDeltaRuleBwdDhuParams params)
 {
+    const auto qShape = params.q->GetViewShape();
+    const auto doShape = params.dO->GetViewShape();
+    CHECK_COND(qShape.GetDimNum() == 4 && doShape.GetDimNum() == 4, ACLNN_ERR_PARAM_INVALID,
+               "q and dO must be rank 4.");
+    const int64_t stateNum = params.cuSeqlensOptional == nullptr
+        ? qShape.GetDim(0)
+        : static_cast<int64_t>(params.cuSeqlensOptional->Size()) - 1;
+    auto checkState = [&](const aclTensor *tensor, const char *name) -> aclnnStatus {
+        if (tensor == nullptr) {
+            return ACLNN_SUCCESS;
+        }
+        const auto shape = tensor->GetViewShape();
+        CHECK_COND(shape.GetDimNum() == 4 && shape.GetDim(0) == stateNum &&
+                       shape.GetDim(1) == doShape.GetDim(1) && shape.GetDim(2) == qShape.GetDim(3) &&
+                       shape.GetDim(3) == doShape.GetDim(3),
+                   ACLNN_ERR_PARAM_INVALID, "%s must be [N,Hv,K,V].", name);
+        return ACLNN_SUCCESS;
+    };
+    CHECK_RET(checkState(params.h0Optional, "h0Optional") == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
+    CHECK_RET(checkState(params.dhtOptional, "dhtOptional") == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
+    CHECK_RET(checkState(params.dh0Out, "dh0Out") == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     return ACLNN_SUCCESS;
 }
 
@@ -125,6 +146,18 @@ static aclnnStatus ParamsDataContiguous(ChunkGatedDeltaRuleBwdDhuParams &params,
 
 static aclnnStatus CheckDtype(ChunkGatedDeltaRuleBwdDhuParams params)
 {
+    if (params.h0Optional != nullptr) {
+        CHECK_COND(params.h0Optional->GetDataType() == DataType::DT_FLOAT, ACLNN_ERR_PARAM_INVALID,
+                   "h0Optional must be FP32 after normalization.");
+    }
+    if (params.dhtOptional != nullptr) {
+        CHECK_COND(params.dhtOptional->GetDataType() == DataType::DT_FLOAT, ACLNN_ERR_PARAM_INVALID,
+                   "dhtOptional must be FP32 after normalization.");
+    }
+    if (params.dh0Out != nullptr) {
+        CHECK_COND(params.dh0Out->GetDataType() == DataType::DT_FLOAT, ACLNN_ERR_PARAM_INVALID,
+                   "dh0Out must be FP32.");
+    }
     return ACLNN_SUCCESS;
 }
 

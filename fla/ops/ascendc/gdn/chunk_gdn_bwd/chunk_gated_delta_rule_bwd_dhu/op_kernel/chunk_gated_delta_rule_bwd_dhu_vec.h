@@ -28,13 +28,15 @@ public:
     __aicore__ inline GDRVec(){};
     __aicore__ inline void Process();
     __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR w, GM_ADDR d_o, GM_ADDR dv, GM_ADDR g, GM_ADDR gk,
-                                GM_ADDR cu_seqlens,
-                                GM_ADDR dv2, GM_ADDR dh, GM_ADDR workspace, const ChunkGatedDeltaRuleBwdDhuTilingData& tilingData);
+                                GM_ADDR dht, GM_ADDR cu_seqlens, GM_ADDR dv2, GM_ADDR dh, GM_ADDR dh0,
+                                GM_ADDR workspace, const ChunkGatedDeltaRuleBwdDhuTilingData& tilingData);
 private:
     __aicore__ inline void TailChunkProcess(uint32_t tailChunkLen); 
     __aicore__ inline void InitUB();
-    __aicore__ inline void InitGlobalTensor(GM_ADDR q, GM_ADDR dv, GM_ADDR g, GM_ADDR gk, GM_ADDR cu_seqlens,
-                                            GM_ADDR dv2, GM_ADDR dh, GM_ADDR workspace);
+    __aicore__ inline void InitGlobalTensor(GM_ADDR q, GM_ADDR dv, GM_ADDR g, GM_ADDR gk, GM_ADDR dht,
+                                            GM_ADDR cu_seqlens, GM_ADDR dv2, GM_ADDR dh, GM_ADDR dh0,
+                                            GM_ADDR workspace);
+    __aicore__ inline void InitState();
     __aicore__ inline void CaclOffset(const uint32_t coarseTaskIdx, const uint32_t h, uint64_t& tailChunkLen);
     __aicore__ inline void CalcGatedQ(float& gLast, float& gLastExp, const bool isLastChunk);
     __aicore__ inline void CalcDv2(const float gLast, uint64_t& curGmOffsetV, const bool isLastChunk);
@@ -47,6 +49,7 @@ protected:
     uint64_t gmOffsetK_ = 0;
     uint64_t gmOffsetV_ = 0;
     uint64_t gmOffsetH_ = 0;
+    uint64_t gmOffsetState_ = 0;
 
     uint64_t bdvOffset_ = 0;
     uint64_t gatedQOffset_ = 0;
@@ -62,12 +65,13 @@ protected:
 
 template <typename DT, typename GT, typename GKT>
 __aicore__ inline void GDRVec<DT, GT, GKT>::Init(GM_ADDR q, GM_ADDR k, GM_ADDR w, GM_ADDR d_o, GM_ADDR dv, GM_ADDR g,
-                                        GM_ADDR gk, GM_ADDR cu_seqlens,
-                                        GM_ADDR dv2, GM_ADDR dh, GM_ADDR workspace, const ChunkGatedDeltaRuleBwdDhuTilingData& tilingData)
+                                        GM_ADDR gk, GM_ADDR dht, GM_ADDR cu_seqlens, GM_ADDR dv2, GM_ADDR dh,
+                                        GM_ADDR dh0, GM_ADDR workspace,
+                                        const ChunkGatedDeltaRuleBwdDhuTilingData& tilingData)
 {
     GDRBase<DT, GT, GKT>::InitTilingData(tilingData);
     InitUB();
-    InitGlobalTensor(q, dv, g, gk, cu_seqlens, dv2, dh, workspace);
+    InitGlobalTensor(q, dv, g, gk, dht, cu_seqlens, dv2, dh, dh0, workspace);
 }
 
 template <typename DT, typename GT, typename GKT>
@@ -122,14 +126,20 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::InitUB()
 
 template <typename DT, typename GT, typename GKT>
 __aicore__ inline void GDRVec<DT, GT, GKT>::InitGlobalTensor(GM_ADDR q, GM_ADDR dv, GM_ADDR g, GM_ADDR gk,
-                                                            GM_ADDR cu_seqlens, GM_ADDR dv2, GM_ADDR dh,
-                                                            GM_ADDR workspace)
+                                                            GM_ADDR dht, GM_ADDR cu_seqlens, GM_ADDR dv2,
+                                                            GM_ADDR dh, GM_ADDR dh0, GM_ADDR workspace)
 {
     if (this->hasG) {
         this->gGm.SetGlobalBuffer((__gm__ GT *)g);
     }
     if (this->hasGk) {
         this->gkGm.SetGlobalBuffer((__gm__ GKT *)gk);
+    }
+    if (this->hasDht) {
+        this->dhtGm.SetGlobalBuffer((__gm__ float *)dht);
+    }
+    if (this->needDh0) {
+        this->dh0Gm.SetGlobalBuffer((__gm__ float *)dh0);
     }
     this->qGm.SetGlobalBuffer((__gm__ DT *)q);
     this->dvGm.SetGlobalBuffer((__gm__ DT *)dv);
@@ -165,6 +175,7 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::Process( )
         for (uint32_t h = hq * static_cast<uint32_t>(this->hvPerHk); h < hGroupEnd; h++) {
             uint64_t tailChunkLen = 0;
             CaclOffset(i, h, tailChunkLen);
+            InitState();
             float gLast = 0.0;
             float gLastExp = 1.0;
             uint64_t curGmOffsetV = 0;
@@ -190,18 +201,28 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::Process( )
                 CalcGatedQ(gLast, gLastExp, isLastChunk);
                 // 計算dv2 dv2 = bdv * exp(bg_last - bg) + dv[B,H,T,V]
                 CalcDv2(gLast, curGmOffsetV, isLastChunk);
-                if (chunkIdx_ > 0) {
-                    CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_DV2); // 计算完一个chunk的dv2,通知cube可以开始计算w @ dv2 
-                }
+                CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_DV2);
                 // updated dh
-                if (chunkIdx_ == 0 && !isLastChunk) {
-                    // 每個chunk更新bdh給下個chunk用，chunkIdx=0作爲最後一個chunk，所有的chunk都已經更新完了，無需更新bdh。
-                    continue;
-                }
                 UpdateDh(gLastExp, curGmOffsetH, isLastChunk);
             }
         }
     }
+}
+
+template <typename DT, typename GT, typename GKT>
+__aicore__ inline void GDRVec<DT, GT, GKT>::InitState()
+{
+    const uint64_t subOffset = static_cast<uint64_t>(this->subBlockIdx) * this->dhBufSize;
+    // gmOffsetH_ already includes the K-half offset for sub-block 1.
+    const uint64_t lastDhOffset = gmOffsetH_ + static_cast<uint64_t>(curChunkNum_ - 1) * dhBlockSize_;
+    if (this->hasDht) {
+        CopyIn(this->bdhCastLocal, this->bdhCastLocal, this->dhtGm[gmOffsetState_ + subOffset],
+               this->dhBufSize, false);
+        CopyOut(this->bdhLocal, this->bdhCastLocal, this->dhGm[lastDhOffset], this->dhBufSize);
+    } else {
+        InitOutput<DT>(this->dhGm[lastDhOffset], this->dhBufSize, 0);
+    }
+    CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_BDH);
 }
 
 template <typename DT, typename GT, typename GKT>
@@ -226,9 +247,7 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::TailChunkProcess(uint32_t tailChunkL
     CalcGatedQ(gLast, gLastExp, true);
     // 計算dv2 dv2 = bdv * exp(bg_last - bg) + dv[B,H,T,V]
     CalcDv2(gLast, curGmOffsetV, true);
-    if (chunkIdx_ > 0) {
-        CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_DV2); // 计算完一个chunk的dv2,通知cube可以开始计算w @ dv2 
-    }
+    CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_DV2);
     // updated dh
     UpdateDh(gLastExp, curGmOffsetH, true);
 }
@@ -276,6 +295,8 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::CaclOffset(const uint32_t coarseTask
     gmOffsetH_ = (b * this->Hv + h) * this->chunkNum * dhBlockSize_ + preChunkNum * dhBlockSize_;
     gmOffsetG_ = (b * this->Hv + h) * this->T + seqStartOffset;
     gmOffsetGk_ = ((b * this->Hv + h) * this->T + seqStartOffset) * this->K;
+    const uint64_t stateSeqIdx = this->isVarLen ? coarseTaskIdx / this->Hk : b;
+    gmOffsetState_ = (stateSeqIdx * this->Hv + h) * dhBlockSize_;
 
     if (this->subBlockIdx == 1) {
         gatedQOffset_ += this->halfBT * this->K;
@@ -311,9 +332,7 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::CalcGatedQ(float& gLast, float& gLas
             gLast = 0.0f;
             gLastExp = 1.0f;
         }
-        if (chunkIdx_ != 0) {
-            CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_GQ);
-        }
+        CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_GQ);
         return;
     }
     if (this->hasG) {
@@ -351,9 +370,6 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::CalcGatedQ(float& gLast, float& gLas
         gLast = 0.0f;
         gLastExp = 1.0f;
     }
-    if (chunkIdx_ == 0) {
-        return; // chunkIdx==0时，不再需要更新dh，只需要拿到g和gLast用于计算dv2即可。
-    }
     // COPY IN Q [B,Hk,T,K]
     CopyIn(this->qCastLocal, this->qLocal, this->qGm[gmOffsetK_ + bos_ * this->K], this->curCalcTK);
     // qCastLocal[halfBT, K] * gExp[halfBT, ] K=128,256 halfBT=32,64
@@ -372,27 +388,19 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::CalcDv2(const float gLast, uint64_t&
                                                     const bool isLastChunk)
 {
     curGmOffsetV = gmOffsetV_ + bos_ * this->V;
-    if (isLastChunk) {
-        // dv -> dv2 無需cast， 不依賴cube計算結果
-        CopyIn(this->dvCastLocal, this->vInLocal, this->dvGm[curGmOffsetV], this->curCalcTV, false);
-        SetFlag<HardEvent::MTE2_MTE3>(EVENT_MTE2_MTE3);
-        WaitFlag<HardEvent::MTE2_MTE3>(EVENT_MTE2_MTE3);
-        CopyOut(this->vInLocal, this->dvCastLocal, this->dv2Gm[curGmOffsetV], this->curCalcTV, false);
-    } else {
-        CopyIn(this->dvCastLocal, this->vInLocal, this->dvGm[curGmOffsetV], this->dvBufSize);
-        CrossCoreWaitFlag(CROSS_CORE_C2V_BDV); // cube计算完一个chunk的bdv,vec开始计算对应的dv2
-        CopyIn(this->bdvCastLocal, this->vInLocal, this->bdvGm[bdvOffset_], this->dvBufSize);
-        if (this->hasG) {
-            Muls(this->gCastLocal, this->gCastLocal, static_cast<float>(-1.0), this->halfBT);
-            Adds(this->gCastLocal, this->gCastLocal, gLast, this->halfBT);
-            Exp(this->gCastLocal, this->gCastLocal, this->halfBT);
-            uint8_t repeatTimes = Ceil(this->halfBT, FP32_PER_BLOCK); // halfBT is 32 or 64
-            Brcb(this->gBrcbLocal, this->gCastLocal, repeatTimes, {1,FP32_PER_BLOCK});
-            BlockMul(this->bdvCastLocal, this->gBrcbLocal, this->bdvCastLocal, this->halfBT, this->V);
-        }
-        Add(this->bdvCastLocal, this->bdvCastLocal, this->dvCastLocal, this->dvBufSize);
-        CopyOut(this->vInLocal, this->bdvCastLocal, this->dv2Gm[curGmOffsetV], this->dvBufSize);
+    CopyIn(this->dvCastLocal, this->vInLocal, this->dvGm[curGmOffsetV], this->curCalcTV);
+    CrossCoreWaitFlag(CROSS_CORE_C2V_BDV);
+    CopyIn(this->bdvCastLocal, this->vInLocal, this->bdvGm[bdvOffset_], this->curCalcTV);
+    if (this->hasG) {
+        Muls(this->gCastLocal, this->gCastLocal, static_cast<float>(-1.0), this->curCalcBT);
+        Adds(this->gCastLocal, this->gCastLocal, gLast, this->curCalcBT);
+        Exp(this->gCastLocal, this->gCastLocal, this->curCalcBT);
+        uint8_t repeatTimes = Ceil(this->curCalcBT, FP32_PER_BLOCK);
+        Brcb(this->gBrcbLocal, this->gCastLocal, repeatTimes, {1,FP32_PER_BLOCK});
+        BlockMul(this->bdvCastLocal, this->gBrcbLocal, this->bdvCastLocal, this->curCalcBT, this->V);
     }
+    Add(this->bdvCastLocal, this->bdvCastLocal, this->dvCastLocal, this->curCalcTV);
+    CopyOut(this->vInLocal, this->bdvCastLocal, this->dv2Gm[curGmOffsetV], this->curCalcTV);
 }
 
 template <typename DT, typename GT, typename GKT>
@@ -400,11 +408,7 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::UpdateDh(const float gLastExp, uint6
                                                 const bool isLastChunk)
 {
     curGmOffsetH = gmOffsetH_ + chunkIdx_ * dhBlockSize_;
-    if (isLastChunk) {
-        // 初始化全零 dh_chunkIdx
-        InitOutput<DT>(this->dhGm[curGmOffsetH], this->dhBufSize, 0); // 兩個vec核各初始化一半
-    } else {
-        if (this->hasGk) {
+    if (this->hasGk) {
             // gCastLocal aliases the beginning of bdhCastLocal in the shared UB buffer. Finish the
             // gk load/exp/broadcast before copying bdh in, otherwise the gk load corrupts the first
             // FP32 block of every [halfK, V] bdh tile (global K rows 0/halfK, V columns 0:64).
@@ -414,17 +418,13 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::UpdateDh(const float gLastExp, uint6
             Exp(this->gCastLocal, this->gCastLocal, this->halfK);
             uint8_t repeatTimes = Ceil(this->halfK, FP32_PER_BLOCK);
             Brcb(this->qdoCastLocal, this->gCastLocal, repeatTimes, {1,FP32_PER_BLOCK});
-        }
-        CopyIn(this->bdhCastLocal, this->bdhLocal, this->dhGm[curGmOffsetH], this->dhBufSize);
-        if (this->hasG) {
-            Muls(this->bdhCastLocal, this->bdhCastLocal, gLastExp, this->dhBufSize);
-        }
-        if (this->hasGk) {
-            BlockMul(this->bdhCastLocal, this->qdoCastLocal, this->bdhCastLocal, this->halfK, this->V);
-        }
     }
-    if (chunkIdx_ == 0) {
-        return;
+    CopyIn(this->bdhCastLocal, this->bdhLocal, this->dhGm[curGmOffsetH], this->dhBufSize);
+    if (this->hasG) {
+        Muls(this->bdhCastLocal, this->bdhCastLocal, gLastExp, this->dhBufSize);
+    }
+    if (this->hasGk) {
+        BlockMul(this->bdhCastLocal, this->qdoCastLocal, this->bdhCastLocal, this->halfK, this->V);
     }
     // dh_updated = dh_i-1 * exp(bg_last) + term1*scale - term2
     CrossCoreWaitFlag(CROSS_CORE_C2V_TERM1); 
@@ -433,9 +433,7 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::UpdateDh(const float gLastExp, uint6
         if (this->isScale) {
             Muls(this->qdoCastLocal, this->qdoCastLocal, this->scale, this->dhBufSize);
         }
-        if (!isLastChunk) {
-            Add(this->qdoCastLocal, this->bdhCastLocal, this->qdoCastLocal, this->dhBufSize);
-        }
+        Add(this->qdoCastLocal, this->bdhCastLocal, this->qdoCastLocal, this->dhBufSize);
     }
     CrossCoreWaitFlag(CROSS_CORE_C2V_TERM2);
     {
@@ -443,8 +441,16 @@ __aicore__ inline void GDRVec<DT, GT, GKT>::UpdateDh(const float gLastExp, uint6
         Muls(this->wv2CastLocal, this->wv2CastLocal, static_cast<float>(-1.0), this->dhBufSize);
         Add(this->qdoCastLocal, this->qdoCastLocal, this->wv2CastLocal, this->dhBufSize);
     }
-    CopyOut(this->bdhLocal, this->qdoCastLocal, this->dhGm[curGmOffsetH - dhBlockSize_], this->dhBufSize);
-    CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_BDH);
+    if (chunkIdx_ == 0) {
+        if (this->needDh0) {
+            const uint64_t subOffset = static_cast<uint64_t>(this->subBlockIdx) * this->dhBufSize;
+            CopyOut(this->qdoCastLocal, this->qdoCastLocal, this->dh0Gm[gmOffsetState_ + subOffset],
+                    this->dhBufSize, false);
+        }
+    } else {
+        CopyOut(this->bdhLocal, this->qdoCastLocal, this->dhGm[curGmOffsetH - dhBlockSize_], this->dhBufSize);
+        CrossCoreSetFlag<0x2, PIPE_MTE3>(CROSS_CORE_V2C_BDH);
+    }
 }
 
 } // namespace ChunkGDRBwdDhu

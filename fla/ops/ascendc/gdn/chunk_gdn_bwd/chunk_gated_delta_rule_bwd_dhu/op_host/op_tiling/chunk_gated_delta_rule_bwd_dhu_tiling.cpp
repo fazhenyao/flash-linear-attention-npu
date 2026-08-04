@@ -27,6 +27,8 @@ constexpr uint32_t INPUT_DO_IDX = 3;
 constexpr uint32_t INPUT_DV_IDX = 4;
 constexpr uint32_t INPUT_G_IDX = 5;
 constexpr uint32_t INPUT_GK_IDX = 6;
+constexpr uint32_t INPUT_H0_IDX = 7;
+constexpr uint32_t INPUT_DHT_IDX = 8;
 constexpr uint32_t INPUT_CU_SEQLENS_IDX = 9;
 constexpr uint32_t INPUT_CHUNK_INDICES_IDX = 10;
 
@@ -60,6 +62,8 @@ static void ChunkGatedDeltaRuleBwdDhuTilingDataPrint(gert::TilingContext *contex
     OP_LOGD(nodeName, "isScale is %lu.", tiling.isScale);
     OP_LOGD(nodeName, "hasG is %lu.", tiling.hasG);
     OP_LOGD(nodeName, "hasGk is %lu.", tiling.hasGk);
+    OP_LOGD(nodeName, "hasDht is %lu.", tiling.hasDht);
+    OP_LOGD(nodeName, "needDh0 is %lu.", tiling.needDh0);
     OP_LOGD(nodeName, "usedCoreNum is %u.", tiling.usedCoreNum);
     OP_LOGD(nodeName, "scale is %f.", tiling.scale);
 }
@@ -100,6 +104,8 @@ ASCENDC_EXTERN_C ge::graphStatus Tiling4ChunkGDRBwdDhu(gert::TilingContext *cont
         gkShape = *context->GetOptionalInputShape(INPUT_GK_IDX);
         gkShapePtr = &gkShape;
     }
+    const gert::StorageShape *h0ShapePtr = context->GetOptionalInputShape(INPUT_H0_IDX);
+    const gert::StorageShape *dhtShapePtr = context->GetOptionalInputShape(INPUT_DHT_IDX);
 
     ChunkGatedDeltaRuleBwdDhuTilingContext ctx{
         context->GetNodeName(),
@@ -110,6 +116,8 @@ ASCENDC_EXTERN_C ge::graphStatus Tiling4ChunkGDRBwdDhu(gert::TilingContext *cont
         context->GetInputShape(INPUT_DV_IDX),
         gShapePtr,
         gkShapePtr,
+        h0ShapePtr,
+        dhtShapePtr,
         context->GetOptionalInputShape(INPUT_CU_SEQLENS_IDX),
         context->GetOptionalInputShape(INPUT_CHUNK_INDICES_IDX),
         qInputDesc->GetDataType(),
@@ -117,6 +125,8 @@ ASCENDC_EXTERN_C ge::graphStatus Tiling4ChunkGDRBwdDhu(gert::TilingContext *cont
         gkInputDesc != nullptr ? gkInputDesc->GetDataType() : ge::DT_FLOAT,
         gShapePtr != nullptr,
         gkShapePtr != nullptr,
+        h0ShapePtr != nullptr,
+        dhtShapePtr != nullptr,
         scalePtr != nullptr,
         scalePtr != nullptr ? *scalePtr : 1.0,
         chunkSizePtr != nullptr ? static_cast<int32_t>(*chunkSizePtr) : static_cast<int32_t>(64),

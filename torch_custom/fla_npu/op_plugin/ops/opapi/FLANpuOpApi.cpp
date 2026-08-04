@@ -243,13 +243,16 @@ bool ResolveChunkLocalCumsumOutputDtype(
         auto chunk_indices_ref = chunk_indices.value();
         chunk_num = chunk_indices_ref.size() / 2;
     }
+    const int64_t state_num = cu_seqlens.has_value()
+        ? static_cast<int64_t>(cu_seqlens.value().size()) - 1
+        : B;
 
-    // 创建输出 tensor：dh/dh0 与 value 头维 Hv 对齐（device 输出 [B,Hv,chunk_num,K,V]）
+    // dh keeps the existing chunk layout; dh0 follows the K-first state layout [N,Hv,K,V].
     at::Tensor dv2 = at::empty_like(dv);
     at::Tensor dh = at::empty({B, Hv, chunk_num, K, V}, q.options());
     at::Tensor dh0;
     if (h0.has_value()) {
-        dh0 = at::empty({B, Hv, chunk_num, K, V}, q.options());
+        dh0 = at::empty({state_num, Hv, K, V}, q.options().dtype(at::kFloat));
     } else {
         dh0 = at::Tensor();
     }
@@ -257,8 +260,8 @@ bool ResolveChunkLocalCumsumOutputDtype(
     // optional tensor处理
     const at::Tensor &g_  = c10::value_or_else(g,  [] { return at::Tensor(); });
     const at::Tensor &gK_ = c10::value_or_else(gK, [] { return at::Tensor(); });
-    const at::Tensor &h0_ = c10::value_or_else(h0, [] { return at::Tensor(); });
-    const at::Tensor &dht_ = c10::value_or_else(dht, [] { return at::Tensor(); });
+    const at::Tensor &h0Input = c10::value_or_else(h0, [] { return at::Tensor(); });
+    const at::Tensor &dhtInput = c10::value_or_else(dht, [] { return at::Tensor(); });
 
     if (g_.defined()) {
         TORCH_CHECK(
@@ -274,27 +277,32 @@ bool ResolveChunkLocalCumsumOutputDtype(
             gK_.dim() == 4 && gK_.size(0) == B && gK_.size(1) == Hv && gK_.size(2) == T && gK_.size(3) == K,
             "npu_chunk_gated_delta_rule_bwd_dhu: gK must be [B,Hv,T,K]; gK=", gK_.sizes());
     }
-    if (h0_.defined()) {
+    if (h0Input.defined()) {
         TORCH_CHECK(
-            h0_.dim() == 5 && h0_.size(0) == B && h0_.size(1) == Hv && h0_.size(2) == chunk_num,
-            "npu_chunk_gated_delta_rule_bwd_dhu: h0 must be [B,Hv,chunk_num,K,V]; h0=", h0_.sizes(),
-            " chunk_num=", chunk_num);
+            h0Input.dim() == 4 && h0Input.size(0) == state_num && h0Input.size(1) == Hv &&
+                h0Input.size(2) == K && h0Input.size(3) == V,
+            "npu_chunk_gated_delta_rule_bwd_dhu: h0 must be [N,Hv,K,V]; h0=", h0Input.sizes(),
+            " N=", state_num);
     }
-    if (dht_.defined()) {
+    if (dhtInput.defined()) {
         TORCH_CHECK(
-            dht_.dim() == 5 && dht_.size(0) == B && dht_.size(1) == Hv && dht_.size(2) == chunk_num,
-            "npu_chunk_gated_delta_rule_bwd_dhu: dht must be [B,Hv,chunk_num,K,V]; dht=", dht_.sizes(),
-            " chunk_num=", chunk_num);
+            dhtInput.dim() == 4 && dhtInput.size(0) == state_num && dhtInput.size(1) == Hv &&
+                dhtInput.size(2) == K && dhtInput.size(3) == V,
+            "npu_chunk_gated_delta_rule_bwd_dhu: dht must be [N,Hv,K,V]; dht=", dhtInput.sizes(),
+            " N=", state_num);
     }
 
     at::Tensor gKKernel = gK_.defined() ? gK_.to(at::kFloat) : gK_;
+    at::Tensor h0Kernel = h0Input.defined() ? h0Input.to(at::kFloat) : h0Input;
+    at::Tensor dhtKernel = dhtInput.defined() ? dhtInput.to(at::kFloat) : dhtInput;
     (void)use_exp2; // Compatibility-only: the kernel now always applies exp2 gate semantics.
+    (void)transpose_state_layout; // Compatibility-only: state layout remains [N,Hv,K,V].
 
     // 调用ACLNN算子
     EXEC_NPU_CMD_EXT(
         aclnnChunkGatedDeltaRuleBwdDhu,
         q, k, w, d_o, dv,
-        g_, gKKernel, h0_, dht_,
+        g_, gKKernel, h0Kernel, dhtKernel,
         cu_seqlens, chunk_indices,
         scale, chunk_size,
         dh, dh0, dv2

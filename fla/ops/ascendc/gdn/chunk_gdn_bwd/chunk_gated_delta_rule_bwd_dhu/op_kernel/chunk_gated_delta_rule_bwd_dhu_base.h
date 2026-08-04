@@ -61,11 +61,13 @@ protected:
     GlobalTensor<DT> qGm;
     GlobalTensor<GT> gGm;
     GlobalTensor<GKT> gkGm;
+    GlobalTensor<float> dhtGm;
     GlobalTensor<DT> dvGm;
     GlobalTensor<int64_t> cuSeqlensGm;
     // output gm, also used as input
     GlobalTensor<DT> dv2Gm;
     GlobalTensor<DT> dhGm;
+    GlobalTensor<float> dh0Gm;
     // inprocess workspace gm
     GlobalTensor<DT> bdvGm;
     GlobalTensor<DT> wv2Gm;
@@ -120,6 +122,8 @@ protected:
     uint64_t isScale = 0;
     uint64_t hasG = 0;
     uint64_t hasGk = 0;
+    uint64_t hasDht = 0;
+    uint64_t needDh0 = 0;
     uint32_t usedCoreNum = 0;
     float  scale = 0;
 
@@ -160,6 +164,8 @@ __aicore__ inline void GDRBase<DT, GT, GKT>::InitTilingData(const ChunkGatedDelt
     this->isScale = tilingData.isScale;
     this->hasG = tilingData.hasG;
     this->hasGk = tilingData.hasGk;
+    this->hasDht = tilingData.hasDht;
+    this->needDh0 = tilingData.needDh0;
     this->usedCoreNum = tilingData.usedCoreNum;
     this->scale = tilingData.scale;
     this->coreIdx = GetBlockIdx();

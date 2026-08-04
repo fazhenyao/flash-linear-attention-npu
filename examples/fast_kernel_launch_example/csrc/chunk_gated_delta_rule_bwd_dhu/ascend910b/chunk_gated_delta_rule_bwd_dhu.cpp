@@ -212,11 +212,18 @@ ChunkGatedDeltaRuleBwdDhuTilingResult CalcTilingParams(
         &doShape,
         &dvShape,
         &gShape,
+        nullptr,
+        nullptr,
+        nullptr,
         cuSeqlensShapePtr,
         chunkIndicesShapePtr,
         ToGeDtype(q.scalar_type()),
         ToGeDtype(g.scalar_type()),
+        ge::DT_FLOAT,
         true,
+        false,
+        false,
+        false,
         true,
         scale,
         static_cast<int32_t>(chunk_size),
@@ -238,7 +245,6 @@ __global__ __aicore__ void chunk_gated_delta_rule_bwd_dhu_kernel(
 {
     (void)gk;
     (void)h0;
-    (void)dht;
     AscendC::AscendCUtils::SetOverflow(1);
     AscendC::SetSysWorkspaceForce(workspace);
     GM_ADDR userWS = AscendC::GetUserWorkspace(workspace);
@@ -250,8 +256,8 @@ __global__ __aicore__ void chunk_gated_delta_rule_bwd_dhu_kernel(
     } else {
         KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIC_1_2);
     }
-    GDN::ChunkGatedDeltaRuleBwdDhuKernelImpl<DT, GT>(
-        q, k, w, d_o, dv, g, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
+    GDN::ChunkGatedDeltaRuleBwdDhuKernelImpl<DT, GT, float>(
+        q, k, w, d_o, dv, g, gk, dht, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
 }
 
 template <typename DT, typename GT>

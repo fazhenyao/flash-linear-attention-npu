@@ -275,15 +275,16 @@ public:
                     CaclOffset(i, h, curChunkNum, curSeqLen, params);
                     uint32_t curBT = 0;
                     for (int32_t chunkIdx = curChunkNum - 1; chunkIdx >= 0; chunkIdx --) {
-                    // cacl k @ dh
-                    if (chunkIdx == curChunkNum -1) {
-                        curBT = curSeqLen - chunkIdx * params.BT;
-                        // skip k_i @ dh_0
-                    } else {
-                        curBT = params.BT;  // BT = 64/128 is always 16 aligned
+                        // Calculate k @ dh for every chunk. The last chunk consumes dht (or zero)
+                        // initialized by AIV; subsequent chunks consume the recurrent dh state.
+                        if (chunkIdx == curChunkNum - 1) {
+                            curBT = curSeqLen - chunkIdx * params.BT;
+                        } else {
+                            curBT = params.BT;  // BT = 64/128 is always 16 aligned
+                        }
                         // init GlobalTensor
                         gmK.SetGlobalBuffer((__gm__ ElementK *)params.k + gmOffsetQK + chunkIdx * params.BT * params.K);
-                         // 用的是上一次chunk迭代的结果
+                        // 用的是上一次chunk迭代的结果
                         gmDh.SetGlobalBuffer((__gm__ ElementDh *)params.dh + gmOffsetH + chunkIdx * params.K * params.V);
                         gmWsBdv.SetGlobalBuffer((__gm__ ElementDh *)params.workspace + coreIdx * params.BT * params.V);
                         auto tensorK = tla::MakeTensor(gmK, params.layoutK, Arch::PositionGM{});
@@ -351,11 +352,9 @@ public:
                         copyL0CToGm_Bdv(tensorBlockBdv, tensorL0C);
                         PipeBarrier<PIPE_ALL>();
                         CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_BDV); // 计算完一个chunk的bdv,通知vec可以开始计算对应的dv2
-                    } // end chunk k @ dh
-                    
 
-                    if (chunkIdx != 0)
-                    {
+                        // Calculate both recurrent-state terms for every chunk. For chunk 0 the
+                        // resulting state is written to dh0 only when h0 is present.
                         gmGq.SetGlobalBuffer((__gm__ ElementGq *)params.workspace + params.gQWorkspaceOffset + coreIdx * params.BT * params.K);
                         gmDo.SetGlobalBuffer((__gm__ ElementDo *)params.dO + gmOffsetV + chunkIdx * params.BT * params.V);
                         gmDhTerm1.SetGlobalBuffer((__gm__ ElementDh *)params.workspace + params.bdhTerm1WorkspaceOffset + coreIdx * params.K * params.V);
@@ -433,10 +432,8 @@ public:
                         auto tensorL0A1 = tla::MakeTensor(l0ATensorDh1, layoutAInL01, Arch::PositionL0A{});
                         auto tensorTileL1A1 = GetTile(tensorL1A1, tla::MakeCoord(0, 0), tla::MakeShape(params.K, curBT));
 
-                        bool initC = true; //k方向没有循环
-                        uint8_t unitFlag = 0;
-                        auto layoutInL0C = tla::MakeLayoutL0C(params.K, params.V);
-                        auto tensorL0C1 = tla::MakeTensor(l0CTensor, layoutInL0C, Arch::PositionL0C{});
+                        auto layoutDhInL0C = tla::MakeLayoutL0C(params.K, params.V);
+                        auto tensorL0C1 = tla::MakeTensor(l0CTensor, layoutDhInL0C, Arch::PositionL0C{});
                         auto tensorTileL0C1 = GetTile(tensorL0C1,
                                                     tla::MakeCoord(0,0),
                                                     tla::MakeShape(params.K, params.V));
@@ -510,9 +507,8 @@ public:
                         copyL0CToGm_Dh2(tensorBlockDh2, tensorL0C2);
                         PipeBarrier<PIPE_ALL>();
                         CrossCoreSetFlag<0x2, PIPE_FIX>(CROSS_CORE_C2V_TERM2);
-                    }
-                }
-                }
+                    } // chunkIdx
+                } // h
             }
         }
         return;

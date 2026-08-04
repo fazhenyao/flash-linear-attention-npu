@@ -35,6 +35,8 @@ static constexpr size_t CHUNK_GDR_BWD_DHU_INPUT_DO_IDX = 3;
 static constexpr size_t CHUNK_GDR_BWD_DHU_INPUT_DV_IDX = 4;
 static constexpr size_t CHUNK_GDR_BWD_DHU_INPUT_G_IDX = 5;
 static constexpr size_t CHUNK_GDR_BWD_DHU_INPUT_GK_IDX = 6;
+static constexpr size_t CHUNK_GDR_BWD_DHU_INPUT_H0_IDX = 7;
+static constexpr size_t CHUNK_GDR_BWD_DHU_INPUT_DHT_IDX = 8;
 
 static constexpr size_t CHUNK_GDR_BWD_DHU_DIM_0 = 0;
 static constexpr size_t CHUNK_GDR_BWD_DHU_DIM_1 = 1;
@@ -70,6 +72,8 @@ struct ChunkGatedDeltaRuleBwdDhuTilingContext {
     const gert::StorageShape *dvShape;
     const gert::StorageShape *gShape;
     const gert::StorageShape *gkShape;
+    const gert::StorageShape *h0Shape;
+    const gert::StorageShape *dhtShape;
     const gert::StorageShape *cuSeqlensShape;
     const gert::StorageShape *chunkIndicesShape;
     ge::DataType qDtype;
@@ -77,6 +81,8 @@ struct ChunkGatedDeltaRuleBwdDhuTilingContext {
     ge::DataType gkDtype;
     bool hasG;
     bool hasGk;
+    bool hasH0;
+    bool hasDht;
     bool hasScaleAttr;
     double scaleAttr;
     int32_t chunkSize;
@@ -259,6 +265,26 @@ public:
             tiling_.seqNum = static_cast<uint64_t>(seqNum);
             tiling_.chunkNum = static_cast<uint64_t>(chunkNum);
         }
+
+        const uint64_t stateNum = isVariableLen_ ? tiling_.seqNum : B_;
+        auto checkStateShape = [&](const gert::StorageShape *storageShape, const char *name) -> ge::graphStatus {
+            if (storageShape == nullptr) {
+                return ge::GRAPH_SUCCESS;
+            }
+            const gert::Shape shape = storageShape->GetStorageShape();
+            OP_CHECK_IF(shape.GetDimNum() != CHUNK_GDR_BWD_DHU_NUM_4 ||
+                            shape.GetDim(CHUNK_GDR_BWD_DHU_DIM_0) != static_cast<int64_t>(stateNum) ||
+                            shape.GetDim(CHUNK_GDR_BWD_DHU_DIM_1) != static_cast<int64_t>(Hv_) ||
+                            shape.GetDim(CHUNK_GDR_BWD_DHU_DIM_2) != static_cast<int64_t>(K_) ||
+                            shape.GetDim(CHUNK_GDR_BWD_DHU_DIM_3) != static_cast<int64_t>(V_),
+                        OP_LOGE(ctx_.nodeName, "%s must be [N,Hv,K,V] with N=%lu.", name, stateNum),
+                        return ge::GRAPH_FAILED);
+            return ge::GRAPH_SUCCESS;
+        };
+        OP_CHECK_IF(checkStateShape(ctx_.h0Shape, "h0") != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
+        OP_CHECK_IF(checkStateShape(ctx_.dhtShape, "dht") != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
+        tiling_.hasDht = ctx_.hasDht ? 1 : 0;
+        tiling_.needDh0 = ctx_.hasH0 ? 1 : 0;
         return ge::GRAPH_SUCCESS;
     }
 

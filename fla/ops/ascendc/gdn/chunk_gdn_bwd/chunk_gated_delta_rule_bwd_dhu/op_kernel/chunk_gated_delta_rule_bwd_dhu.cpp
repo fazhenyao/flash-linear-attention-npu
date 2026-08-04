@@ -33,10 +33,10 @@ namespace GDN {
 
 template <typename DT, typename GT, typename GKT>
 __aicore__ inline void ChunkGatedDeltaRuleBwdDhuKernelImpl(
-    GM_ADDR q, GM_ADDR k, GM_ADDR w, GM_ADDR d_o, GM_ADDR dv, GM_ADDR g, GM_ADDR gk, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
-    GM_ADDR dh, GM_ADDR dh0, GM_ADDR dv2, GM_ADDR userWS, const ChunkGatedDeltaRuleBwdDhuTilingData *tilingData)
+    GM_ADDR q, GM_ADDR k, GM_ADDR w, GM_ADDR d_o, GM_ADDR dv, GM_ADDR g, GM_ADDR gk, GM_ADDR dht,
+    GM_ADDR cu_seqlens, GM_ADDR chunk_indices, GM_ADDR dh, GM_ADDR dh0, GM_ADDR dv2, GM_ADDR userWS,
+    const ChunkGatedDeltaRuleBwdDhuTilingData *tilingData)
 {
-    (void)dh0;
     if ASCEND_IS_AIC {
         GDRCube<DT, GT> cubeOp(k, w, d_o, dh, dv2, cu_seqlens, chunk_indices, userWS);
         cubeOp.Init(*tilingData);
@@ -44,7 +44,7 @@ __aicore__ inline void ChunkGatedDeltaRuleBwdDhuKernelImpl(
     }
     if ASCEND_IS_AIV {
         ChunkGDRBwdDhu::GDRVec<DT, GT, GKT> op;
-        op.Init(q, k, w, d_o, dv, g, gk, cu_seqlens, dv2, dh, userWS, *tilingData);
+        op.Init(q, k, w, d_o, dv, g, gk, dht, cu_seqlens, dv2, dh, dh0, userWS, *tilingData);
         op.Process();
     }
 }
@@ -57,7 +57,6 @@ extern "C" __global__ __aicore__ void chunk_gated_delta_rule_bwd_dhu(
     GM_ADDR cu_seqlens, GM_ADDR chunk_indices, GM_ADDR dh, GM_ADDR dh0, GM_ADDR dv2, GM_ADDR workspace, GM_ADDR tiling)
 {
     (void)h0;
-    (void)dht;
     GM_ADDR userWS = AscendC::GetUserWorkspace(workspace);
     if (userWS == nullptr) {
         return;
@@ -69,15 +68,15 @@ extern "C" __global__ __aicore__ void chunk_gated_delta_rule_bwd_dhu(
     if (TILING_KEY_IS(1)) {
         KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::ChunkGatedDeltaRuleBwdDhuKernelImpl<DTYPE_Q, DTYPE_Q, float>(
-            q, k, w, d_o, dv, g, gk, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
+            q, k, w, d_o, dv, g, gk, dht, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
     } else if (TILING_KEY_IS(2)) {
         KERNEL_TASK_TYPE(2, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::ChunkGatedDeltaRuleBwdDhuKernelImpl<DTYPE_Q, float, float>(
-            q, k, w, d_o, dv, g, gk, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
+            q, k, w, d_o, dv, g, gk, dht, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
     } else if (TILING_KEY_IS(3)) {
         KERNEL_TASK_TYPE(3, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::ChunkGatedDeltaRuleBwdDhuKernelImpl<DTYPE_Q, DTYPE_Q, float>(
-            q, k, w, d_o, dv, g, gk, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
+            q, k, w, d_o, dv, g, gk, dht, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
     }
 }
 #endif
