@@ -52,6 +52,7 @@ _GET_WORKSPACE_ARGTYPES = {
         ctypes.c_void_p,
         ctypes.c_void_p,
         ctypes.c_void_p,
+        ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_void_p),
     ],

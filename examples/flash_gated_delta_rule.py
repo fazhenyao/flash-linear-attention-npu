@@ -37,16 +37,70 @@ from fla_npu.ops.ascendc import (
     recompute_w_u_fwd as ascendc_recompute_w_u_fwd,
     solve_tri as ascendc_solve_tri,
 )
-from fla_npu.ops.triton import (
-    autocast_custom_bwd,
-    autocast_custom_fwd,
-    chunk_local_cumsum as triton_chunk_local_cumsum,
-    chunk_scaled_dot_kkt_fwd as triton_chunk_scaled_dot_kkt_fwd,
-    input_guard,
-    l2norm_bwd,
-    l2norm_fwd,
-    solve_tril_npu as solve_tril,
-)
+_TRITON_DISABLED = os.environ.get("FLA_NPU_DISABLE_TRITON", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _identity_decorator(fn):
+    return fn
+
+
+def _torch_l2norm_fwd(x: torch.Tensor):
+    # Keep q/k normalization available for an Ascend-C-only run.  The custom
+    # Triton l2norm is an optimization; this eager formula has the same
+    # forward semantics and works on an NPU tensor.
+    rstd = torch.rsqrt((x.float() * x.float()).mean(dim=-1, keepdim=True) + 1e-6)
+    return (x.float() * rstd).to(x.dtype), rstd
+
+
+def _torch_l2norm_bwd(x: torch.Tensor, rstd: torch.Tensor, dx: torch.Tensor):
+    # ``x`` is the normalized forward output (the same convention used by
+    # the Triton backward kernel), not the pre-normalization input.
+    x_f = x.float()
+    dx_f = dx.float()
+    return (dx_f * rstd - (dx_f * x_f).sum(dim=-1, keepdim=True) * x_f * rstd).to(dx.dtype)
+
+
+def _triton_unavailable(*args, **kwargs):
+    raise RuntimeError(
+        "The current path requires a Triton fallback, but Triton is unavailable. "
+        "Use an Ascend C-supported shape/dtype or install the Triton package."
+    )
+
+
+if _TRITON_DISABLED:
+    autocast_custom_bwd = _identity_decorator
+    autocast_custom_fwd = _identity_decorator
+    input_guard = _identity_decorator
+    l2norm_fwd = _torch_l2norm_fwd
+    l2norm_bwd = _torch_l2norm_bwd
+
+    triton_chunk_local_cumsum = _triton_unavailable
+    triton_chunk_scaled_dot_kkt_fwd = _triton_unavailable
+    solve_tril = _triton_unavailable
+else:
+    try:
+        from fla_npu.ops.triton import (
+            autocast_custom_bwd,
+            autocast_custom_fwd,
+            chunk_local_cumsum as triton_chunk_local_cumsum,
+            chunk_scaled_dot_kkt_fwd as triton_chunk_scaled_dot_kkt_fwd,
+            input_guard,
+            l2norm_bwd,
+            l2norm_fwd,
+            solve_tril_npu as solve_tril,
+        )
+    except ModuleNotFoundError:
+        # Importing the example must not fail merely because an optional
+        # Triton package is absent.  Ascend-C-only runs set the environment
+        # flag above; otherwise make any accidental fallback explicit.
+        autocast_custom_bwd = _identity_decorator
+        autocast_custom_fwd = _identity_decorator
+        input_guard = _identity_decorator
+        l2norm_fwd = _torch_l2norm_fwd
+        l2norm_bwd = _torch_l2norm_bwd
+        triton_chunk_local_cumsum = _triton_unavailable
+        triton_chunk_scaled_dot_kkt_fwd = _triton_unavailable
+        solve_tril = _triton_unavailable
 
 
 _disable_compile = getattr(getattr(torch, "compiler", None), "disable", lambda fn: fn)
