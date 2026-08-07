@@ -26,6 +26,8 @@ except Exception:
 REPO_ROOT = Path(__file__).resolve().parent
 TORCH_EXTENSION_DIR = REPO_ROOT / "torch_custom" / "fla_npu"
 FLA_NPU_PACKAGE_DIR = TORCH_EXTENSION_DIR / "fla_npu"
+TRITON_CORE_PACKAGE = "fla_npu.ops.triton.triton_core"
+TRITON_CORE_SOURCE = REPO_ROOT / "fla" / "ops" / "triton" / "triton_core"
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from fla_npu_artifacts import get_package_version, get_wheel_build_tag  # noqa: E402
@@ -542,19 +544,27 @@ if _bdist_wheel is not None:
     CMDCLASS["bdist_wheel"] = FlaNpuBdistWheel
 
 
+_packages = find_packages(
+    where=str(TORCH_EXTENSION_DIR),
+    include=["fla_npu", "fla_npu.*"],
+)
+_package_dir = {"fla_npu": str(FLA_NPU_PACKAGE_DIR.relative_to(REPO_ROOT))}
+if TRITON_CORE_SOURCE.exists():
+    if TRITON_CORE_PACKAGE not in _packages:
+        _packages.append(TRITON_CORE_PACKAGE)
+    # Keep the Triton implementation in the source tree while mapping it into
+    # the installed fla_npu namespace.  Without this mapping the wheel only
+    # contains ops/triton/__init__.py and imports fail at runtime.
+    _package_dir[TRITON_CORE_PACKAGE] = str(TRITON_CORE_SOURCE.relative_to(REPO_ROOT))
+
 setup(
     name="flash-linear-attention-npu",
     version=get_package_version(REPO_ROOT),
     description="High-performance linear attention operators for Ascend NPU",
     long_description=(REPO_ROOT / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
-    packages=(
-        find_packages(
-            where=str(TORCH_EXTENSION_DIR),
-            include=["fla_npu", "fla_npu.*"],
-        )
-    ),
-    package_dir={"fla_npu": str(FLA_NPU_PACKAGE_DIR.relative_to(REPO_ROOT))},
+    packages=_packages,
+    package_dir=_package_dir,
     package_data={"fla_npu": ["opp/**/*"]},
     include_package_data=True,
     license_files=[
