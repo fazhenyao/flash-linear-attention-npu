@@ -560,6 +560,35 @@ def recompute_w_u(
     return w, u
 
 
+def _expand_kda_matrix_to_value_heads(
+    A: torch.Tensor,
+    value_heads: int,
+    *,
+    head_dim: int,
+) -> torch.Tensor:
+    """Expand KKT's key-head matrix for value-head consumers.
+
+    ``chunk_scaled_dot_kkt`` produces ``[B, Hk, T, BT]`` at the raw ACLNN
+    boundary.  The shared Python path presents it to ``solve_tri`` as
+    ``[B, T, Hk, BT]``; ``head_dim`` makes the layout explicit at either
+    boundary.  Value-side consumers use ``Hv`` heads.
+    """
+    if A.ndim != 4:
+        raise ValueError(f"KKT matrix must be rank-4, got {tuple(A.shape)}")
+    head_dim = int(head_dim)
+    if head_dim < 0 or head_dim >= A.ndim:
+        raise ValueError(f"invalid head dimension {head_dim} for KKT matrix shape {tuple(A.shape)}")
+    key_heads = int(A.shape[head_dim])
+    value_heads = int(value_heads)
+    if key_heads <= 0 or value_heads <= 0 or value_heads % key_heads != 0:
+        raise ValueError(
+            f"value heads must be a positive multiple of KKT heads, got Hk={key_heads}, Hv={value_heads}"
+        )
+    if key_heads == value_heads:
+        return A
+    return A.repeat_interleave(value_heads // key_heads, dim=head_dim).contiguous()
+
+
 def _float32_output_dtype_name(output_dtype: Optional[torch.dtype | str]) -> str:
     if output_dtype is None:
         return "float32"
@@ -835,6 +864,10 @@ def flash_chunk_gated_delta_rule_fwd(
         output_dtype=k.dtype,
     )
 
+    # KKT returns Hk heads (the auto wrapper presents this as [B,T,Hk,C]).
+    # Expand before solve_tri so the triangular solve and all value-side
+    # consumers operate on the required Hv-head representation.
+    A = _expand_kda_matrix_to_value_heads(A, v.shape[1], head_dim=2)
     A = A.transpose(1, 2).contiguous()
 
     w, u = recompute_w_u(
