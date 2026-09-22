@@ -7,7 +7,7 @@
 #include "aclnn_chunk_kda_fwd.h"
 #include "chunk_kda_fwd.h"
 #include "aclnn_chunk_kda_fwd_v2.h"
-#include "chunk_kda_fwd_three_stage.h"
+#include "chunk_kda_fwd_v2.h"
 
 #include <algorithm>
 #include <cstring>
@@ -32,7 +32,9 @@ extern "C" {
 #endif
 
 namespace {
-constexpr int64_t MAX_KDA_K_DIM = 256;
+// K/V 只交付两档且必须同档：K=V=64 或 K=V=128；混合档与其它取值都不支持。
+constexpr int64_t KDA_FWD_KV_DIM_SMALL = 64;
+constexpr int64_t KDA_FWD_KV_DIM_LARGE = 128;
 constexpr int64_t MAX_KDA_HEAD_NUM = 128;
 constexpr int64_t KDA_STAGE_FULL = -1;
 constexpr int64_t KDA_STAGE_GATE_PREPARE = 0;
@@ -83,6 +85,12 @@ struct ChunkKdaFwdParams {
     const aclTensor *kgOut = nullptr;
     const aclTensor *vNewOut = nullptr;
     const aclTensor *hOut = nullptr;
+    // 反向 L2 norm 保存值；nullptr 表示本次不导出（可选性只在 L2 层表达）。
+    const aclTensor *qHatOut = nullptr;
+    const aclTensor *kHatOut = nullptr;
+    const aclTensor *qRstdOut = nullptr;
+    const aclTensor *kRstdOut = nullptr;
+    const aclTensor *betaEffOut = nullptr;
 };
 
 struct KdaShapeInfo {
@@ -471,10 +479,15 @@ aclnnStatus CheckParams(const ChunkKdaFwdParams &params, KdaFwdLayout &layout, K
                "H and HV must be positive, HV must be greater than or equal to H, and HV must be divisible by H.");
     CHECK_COND(info.hNum <= MAX_KDA_HEAD_NUM && info.hvNum <= MAX_KDA_HEAD_NUM,
                ACLNN_ERR_PARAM_INVALID, "H and HV must be less than or equal to 128.");
-    CHECK_COND(info.kDim >= 16 && info.kDim <= MAX_KDA_K_DIM && info.kDim % 16 == 0 &&
-                   info.vDim >= 16 && info.vDim <= 256 && info.vDim % 16 == 0,
-               ACLNN_ERR_PARAM_INVALID,
-               "K/V must be multiples of 16, K must be <=256, and V must be <=256.");
+    // K/V 仅支持 K=V=64 与 K=V=128 两档，不支持混合档（如 K=64/V=128）或
+    // 其它取值；报错打印实际 K/V，便于调用方直接定位 shape。
+    const bool kvDimSupported =
+        (info.kDim == KDA_FWD_KV_DIM_SMALL && info.vDim == KDA_FWD_KV_DIM_SMALL) ||
+        (info.kDim == KDA_FWD_KV_DIM_LARGE && info.vDim == KDA_FWD_KV_DIM_LARGE);
+    CHECK_COND(kvDimSupported, ACLNN_ERR_PARAM_INVALID,
+               "K/V must both be 64 or both be 128; mixed K/V and other dims are not "
+               "supported, but got Kdim=%ld, Vdim=%ld.",
+               info.kDim, info.vDim);
     CHECK_RET(CheckDtypes(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckCuSeqlens(params.cuSeqlensOptional, info.seqlen) == ACLNN_SUCCESS,
               ACLNN_ERR_PARAM_INVALID);
@@ -555,7 +568,7 @@ bool AllOutputsContiguous(const ChunkKdaFwdParams &params)
 
 // V2 场景判据：三个独立算子的公共约束（BF16、K=V=128、chunk=64、输出可直接写回、
 // cu_seqlens 严格递增）全部满足时才允许走组合实现。
-bool CanUseThreeStagePath(const ChunkKdaFwdParams &params, const KdaShapeInfo &info)
+bool CanUseKdaFwdV2Path(const ChunkKdaFwdParams &params, const KdaShapeInfo &info)
 {
     if (params.q->GetDataType() != DataType::DT_BF16) {
         return false;
@@ -579,10 +592,10 @@ bool CanUseThreeStagePath(const ChunkKdaFwdParams &params, const KdaShapeInfo &i
     return AllOutputsContiguous(params);
 }
 
-l0op::KdaFwdThreeStageArgs MakeThreeStageArgs(const ChunkKdaFwdParams &params,
+l0op::KdaFwdV2Args MakeKdaFwdV2Args(const ChunkKdaFwdParams &params,
                                               const KdaShapeInfo &info)
 {
-    l0op::KdaFwdThreeStageArgs args;
+    l0op::KdaFwdV2Args args;
     args.q = params.q;
     args.k = params.k;
     args.v = params.v;
@@ -627,6 +640,11 @@ l0op::KdaFwdThreeStageArgs MakeThreeStageArgs(const ChunkKdaFwdParams &params,
     args.kgOut = params.kgOut;
     args.vNewOut = params.vNewOut;
     args.hOut = params.hOut;
+    args.qHatOut = params.qHatOut;
+    args.kHatOut = params.kHatOut;
+    args.qRstdOut = params.qRstdOut;
+    args.kRstdOut = params.kRstdOut;
+    args.betaEffOut = params.betaEffOut;
     return args;
 }
 
@@ -937,6 +955,11 @@ aclnnStatus aclnnChunkKdaFwdV2GetWorkspaceSize(
     const aclTensor *kgOut,
     const aclTensor *vNewOut,
     const aclTensor *hOut,
+    const aclTensor *qHatOut,
+    const aclTensor *kHatOut,
+    const aclTensor *qRstdOut,
+    const aclTensor *kRstdOut,
+    const aclTensor *betaEffOut,
     uint64_t *workspaceSize,
     aclOpExecutor **executor)
 {
@@ -945,7 +968,8 @@ aclnnStatus aclnnChunkKdaFwdV2GetWorkspaceSize(
         cuSeqlensOptional, chunkIndicesOptional, layout, scale, chunkSize,
         safeGate, lowerBound, useGateInKernel, stateVFirst, epsilon, useQkL2normInKernel,
         useBetaSigmoidInKernel, allowNegEigval, useExp2, attnOut, finalStateOut, gkOut,
-        aqkOut, akkOut, wOut, uOut, qgOut, kgOut, vNewOut, hOut};
+        aqkOut, akkOut, wOut, uOut, qgOut, kgOut, vNewOut, hOut,
+        qHatOut, kHatOut, qRstdOut, kRstdOut, betaEffOut};
     L2_DFX_PHASE_1(
         aclnnChunkKdaFwdV2,
         DFX_IN(q, k, v, g, beta, aLogOptional, dtBiasOptional, initialStateOptional,
@@ -953,7 +977,8 @@ aclnnStatus aclnnChunkKdaFwdV2GetWorkspaceSize(
                safeGate, lowerBound, useGateInKernel, stateVFirst, epsilon,
                useQkL2normInKernel, useBetaSigmoidInKernel, allowNegEigval, useExp2),
         DFX_OUT(attnOut, finalStateOut, gkOut, aqkOut, akkOut, wOut, uOut,
-                qgOut, kgOut, vNewOut, hOut));
+                qgOut, kgOut, vNewOut, hOut, qHatOut, kHatOut, qRstdOut,
+                kRstdOut, betaEffOut));
 
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
@@ -965,12 +990,12 @@ aclnnStatus aclnnChunkKdaFwdV2GetWorkspaceSize(
 
     // V2 只实现三个独立算子的组合路径；场景不满足时由 Python 入口回落到
     // aclnnChunkKdaFwd，因此这里直接返回参数错误并说明要求。
-    CHECK_COND(CanUseThreeStagePath(params, info), ACLNN_ERR_PARAM_INVALID,
+    CHECK_COND(CanUseKdaFwdV2Path(params, info), ACLNN_ERR_PARAM_INVALID,
                "ChunkKdaFwdV2 只支持三算子组合场景：q/k/v 为 BF16、K=V=128、chunk_size=64、"
                "公开输出连续且 cu_seqlens 严格递增，请改用 aclnnChunkKdaFwd。");
-    const aclnnStatus threeStageStatus =
-        l0op::KdaFwdThreeStage(MakeThreeStageArgs(params, info), executorPtr);
-    CHECK_RET(threeStageStatus == ACLNN_SUCCESS, threeStageStatus);
+    const aclnnStatus kdaFwdV2Status =
+        l0op::KdaFwdV2(MakeKdaFwdV2Args(params, info), executorPtr);
+    CHECK_RET(kdaFwdV2Status == ACLNN_SUCCESS, kdaFwdV2Status);
 
     *workspaceSize = uniqueExecutor->GetWorkspaceSize();
     uniqueExecutor.ReleaseTo(executor);

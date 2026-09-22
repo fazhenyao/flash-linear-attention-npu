@@ -110,6 +110,13 @@ head-major 阶段结果；`hOut` 为空时，单 launch 路径由 kernel workspa
 该规则对齐非 CP 的低层 12 返回值接口；
 第 12 项 `initial_state` 由 Python 层原对象透传。
 
+反向 L2 norm 保存值（`q_hat/k_hat/q_rstd/k_rstd/beta_eff`）不进入上述 12 项返回值，而是
+组合入口尾部的 5 个独立可选输出：调用方传入张量即导出、传空即不产出，同一次调用中两种
+情形的计算结果逐位一致，只有是否落公开 GM 的区别。组合路径用 `ReuseOrAlloc` 直接复用
+调用方张量承载 Prepare 的对应输出，不再额外分配；未传时仍按 Prepare 档位要求分配内部
+张量，保证前向链（FwdH/Finalize）可用。对应的档位约束（`none/forward/recompute/save`）
+与 `ChunkKdaFwdPrepare` 的 outputMask 一致，详见 `chunk_kda_fwd_prepare/docs/design.md`。
+
 ## 模板化方案与 tiling key
 
 `ChunkKdaFwd` 只有一个外层 `op_kernel/chunk_kda_fwd.cpp` 入口和一个私有 L0 类型。A5 实现位于
@@ -145,5 +152,6 @@ key2 下使用其对应单 launch 实现。tiling key 和私有 `stage` 均不�
 - dtype：FP16/BF16。
 - layout：BSND/BNSD/TND/NTD。
 - gate：raw/已激活、safe true/false。
-- Shape：K=128，V=128/256，chunk=64/128，dense/varlen/tail/GQA。
+- Shape：`K=V=64` 或 `K=V=128`（两档且必须同档，混合档与其它取值由参数校验拒绝），
+  chunk=64/128，dense/varlen/tail/GQA。
 - 属性：final state、重计算策略、`state_v_first`。

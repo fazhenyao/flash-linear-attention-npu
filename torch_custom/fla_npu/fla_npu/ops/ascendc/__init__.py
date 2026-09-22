@@ -48,6 +48,7 @@ _ASCENDC_OPS = (
     "npu_chunk_gated_delta_rule_fwd_h",
     "npu_chunk_fwd_h",
     "npu_chunk_kda_fwd_finalize",
+    "npu_chunk_kda_fwd_prepare",
     "npu_recompute_w_u_fwd",
     "npu_recurrent_gated_delta_rule",
     "npu_chunk_gated_delta_rule_fwd",
@@ -63,18 +64,20 @@ _ASCENDC_OPS = (
 )
 
 # Operators the launcher carries that the ctypes reference does not define.
-# Landing here is deliberate, never accidental: with no same-kernel reference to
-# compare against, the operator's parity scenario has to bring its own (a torch
-# implementation, or recorded golden tensors).  stable_coverage.py fails on an
-# operator missing from ctypes *without* being listed here, and on one listed
-# here that ctypes still defines, so the two lists cannot drift apart.
-_LAUNCHER_ONLY_OPS: tuple[str, ...] = ()
+# Derived, never declared: a new operator is not expected to bring a ctypes
+# adapter any more, so being launcher-only is simply the difference between the
+# published list and what `_aclnn_ctypes` still implements.  Nothing to keep in
+# sync by hand, and nothing that can go stale.
+_LAUNCHER_ONLY_OPS: tuple[str, ...] = tuple(
+    name for name in _ASCENDC_OPS if name not in ASCENDC_CTYPES_OPS
+)
 
 # ChunkFwdH 和 ChunkKdaFwdFinalize 仅提供解耦 ctypes 稳定入口，
 # 不注册 torch.ops.npu，也不挂到 torch_npu.ops 的可选兼容命名空间。
 _TORCH_NPU_COMPAT_OPS = tuple(
     name for name in _ASCENDC_OPS
-    if name not in {"npu_chunk_fwd_h", "npu_chunk_kda_fwd_finalize"}
+    if name not in {"npu_chunk_fwd_h", "npu_chunk_kda_fwd_finalize",
+                    "npu_chunk_kda_fwd_prepare"}
 )
 
 BACKWARD_OPS = {
@@ -410,8 +413,9 @@ def _get_stable_op(name: str):
     ``FLA_NPU_STABLE_ABI`` selects the backend: unset / ``stable`` uses
     ``libfla_npu_stable.so`` via torch.ops (falling back to ctypes for anything it
     does not carry), and ``ctypes`` forces the Python reference path.  An
-    operator declared in ``_LAUNCHER_ONLY_OPS`` has no reference to fall back to,
-    so it stays on the launcher even when validation was requested.
+    operator with no ctypes reference (``_LAUNCHER_ONLY_OPS``) has nothing to
+    fall back to, so it stays on the launcher even when validation was
+    requested.
     """
 
     if not _stable_backend_selected() and name not in _LAUNCHER_ONLY_OPS:
