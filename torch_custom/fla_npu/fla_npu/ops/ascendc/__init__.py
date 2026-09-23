@@ -26,6 +26,7 @@ from typing import Callable, Optional
 from ._aclnn_ctypes import ASCENDC_CTYPES_OPS
 
 _ASCENDC_OPS = (
+    "npu_chunk_gated_delta_rule_fwd",
     "npu_fast_gelu_custom",
     "npu_fast_gelu_custom_backward",
     "npu_causal_conv1d",
