@@ -21,7 +21,6 @@ from __future__ import annotations
 import ctypes
 import sys
 
-from ._chunk_scaled_dot_kkt_contract import validate as _validate_chunk_scaled_dot_kkt
 from ._kda_policy import (
     kda_fwd_optional_output_mask,
     _select_kda_bwd_optimized,
@@ -2122,10 +2121,11 @@ def npu_chunk_scaled_dot_kkt(
 ):
     import torch
 
-    B, Hv, T = _validate_chunk_scaled_dot_kkt(k, g, beta, cu_seqlens, chunk_indices, chunk_size)
     k_contig = k.contiguous()
     g_contig = g.contiguous()
     beta_contig = beta.contiguous()
+    B, _, T, _ = _shape(k_contig)
+    _, Hv, _ = _shape(g_contig)
     out = _empty((B, Hv, T, int(chunk_size)), k_contig, dtype=torch.float32)
 
     def nd_tensor(ctx, tensor, name):
