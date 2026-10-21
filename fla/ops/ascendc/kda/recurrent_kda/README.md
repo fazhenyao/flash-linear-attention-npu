@@ -20,7 +20,7 @@ out, final_state = recurrent_kda(
     beta,
     initial_state=None,
     *,
-    cu_seqlens,
+    cu_seqlens=None,
     ssm_state_indices=None,
     A_log=None,
     dt_bias=None,
@@ -28,13 +28,14 @@ out, final_state = recurrent_kda(
     layout="BSND",
     scale=None,
     output_final_state=False,
+    inplace_final_state=True,
     use_qk_l2norm_in_kernel=False,
     use_gate_in_kernel=False,
     use_beta_sigmoid_in_kernel=False,
     allow_neg_eigval=False,
     safe_gate=False,
     lower_bound=None,
-    state_v_first=True,
+    state_v_first=False,
 )
 ```
 
@@ -42,22 +43,21 @@ out, final_state = recurrent_kda(
 
 - `layout="BSND"`：`q/k=[B,T,H,K]`，`v=[B,T,HV,V]`，`g=[B,T,HV,K]`，`beta=[B,T,HV]`。
 - `layout="TND"`：`q/k=[T,H,K]`，`v=[T,HV,V]`，`g=[T,HV,K]`，`beta=[T,HV]`。
-- `initial_state=None` 时，Python wrapper 会创建全零初始状态；显式传入时是 state pool。
+- `initial_state=None` 且 `inplace_final_state=False` 时，Python wrapper 创建全零 FP32 状态；原位模式须显式传入 state pool。
   `state_v_first=True` 对应 `[state_capacity,HV,V,K]`，`state_v_first=False` 对应
   `[state_capacity,HV,K,V]`。支持 slot/head 维带间隔的非连续 view，但内部二维 state
   矩阵必须稠密。
 - Q/K/V 支持融合 storage 切片形成的规则非连续 view；算子保留各自 storage offset，并按 token/head
   stride 直接读取。不满足直接访问约束的 view 在 ACLNN 侧自动回退连续化。
 - `scale=None` 时，Python wrapper 使用 `K ** -0.5`。
-- `use_qk_l2norm_in_kernel=True` 时，kernel 内对每个 token 的 `q/k` 做 L2 normalize，然后对 `q` 乘 `scale`。
+- `use_qk_l2norm_in_kernel=True` 时，kernel 内对每个 token 的 `q/k` 按 `x/sqrt(sum(x*x)+1e-6)` 做 L2 normalize，然后对 `q` 乘 `scale`。
 - `use_gate_in_kernel=False` 时，`g` 被视为已经预计算好的 step log gate，kernel 使用 `exp(g)` 做 state decay。
 - `use_gate_in_kernel=True` 时，`g` 是 raw gate，必须传 `A_log`；可选 `dt_bias`。
   - `safe_gate=False`：`gate = -exp(A_log) * softplus(g + dt_bias)`。
   - `safe_gate=True`：`gate = lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`。
 - `use_beta_sigmoid_in_kernel=True` 时，kernel 使用 `sigmoid(beta)`；若 `allow_neg_eigval=True`，再乘 2。
-- Python/aclnn/legacy 入口支持非连续 `initial_state`。Python 主入口返回 `final_state` 时与输入保持相同
-  storage 和 stride；legacy Torch 入口只返回 `out`，最终状态通过 `initial_state` 原位更新。
-- `cu_seqlens` 是必传的同设备 INT32/INT64 tensor，shape 为 `[seq_num+1]`，使用与 fla-org 一致的
+- Python/aclnn 入口支持非连续 `initial_state`；原位模式返回同 storage/stride 的 state，非原位模式返回独立 state 并保持输入不变。legacy Torch 入口不属于当前支持范围。
+- `cu_seqlens` 可选；为空时 BSND 按 batch 行划分，TND 视为一条序列。显式传入时须为同设备 INT32/INT64 tensor，shape 为 `[seq_num+1]`，使用与 fla-org 一致的
   累积 offset 语义。首项必须为 0，末项等于有效 packed token 数且可小于图捕获的 token capacity，
   相邻差值是各序列长度。host 不读取其值，兼容 ACLGraph capture/replay。
 - `ssm_state_indices` 支持 packed `[T]` 和 speculative `[seq_num,max_step]`。显式索引模式允许 `state_capacity > seq_num`，并仅更新命中的槽。
@@ -81,8 +81,7 @@ o_t = S @ (q_t * scale)
 - `g/beta` Python 入口支持 `FP32/BF16/FP16`，aclnn 预处理后以 `FP32` 输入 kernel。
 - `A_log/dt_bias` 支持 `FP32`。
 - `cu_seqlens` 为必传、与 q 同设备的 INT32/INT64 Tensor；offset 必须单调不减，末项不得超过输入
-  token capacity，各相邻差值必须不超过 8。接口面向 decode / MTP 短序列，dense 单序列与 varlen
-  每段序列长度均必须小于等于 8。末项小于 capacity 时，仅有效 token 对应的输出和 state
+  token capacity，A5通过8-token窗口递推支持更长序列；A2/A3当前工作树每段仍限制为8，扩展实现见 PR #917。末项小于 capacity 时，仅有效 token 对应的输出和 state
   更新有定义，padding tail 输出不作保证。
 - 仅支持 `layout="BSND"` 和 `layout="TND"`。
 - 支持 V-first `[state_capacity,HV,V,K]` 和 K-first `[state_capacity,HV,K,V]`，state dtype 为
