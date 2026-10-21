@@ -27,7 +27,9 @@ using namespace AscendC::MicroAPI;
 constexpr uint64_t BUFFER_NUM = 1;
 constexpr uint64_t INPUT_BUFFER_NUM = 2;
 constexpr uint32_t MAX_OUT_BUFFER_NUM = 2;
+// UB capacity, independent of the logical sequence length.
 constexpr uint64_t MAX_MTP = 8;
+constexpr float QK_L2NORM_EPS = 1e-6f;
 constexpr uint64_t BF16_NUM_PER_BLOCK = 16;
 constexpr uint64_t FP32_NUM_PER_BLOCK = 8;
 constexpr uint32_t REPEAT_LENTH = 64; // 256 bytes for float.
@@ -200,6 +202,9 @@ public:
         betaInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(betaUbSize / sizeof(float)), buffOffset);
         buffOffset += betaUbSize;
         gateInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(MAX_MTP * alignK_), buffOffset);
+        buffOffset += kSize;
+        // Preprocessing later windows must not overwrite the live recurrent state.
+        preprocessTmpInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(MAX_MTP * alignK_), buffOffset);
     }
 
     __aicore__ inline void SyncMte2ToV()
@@ -296,7 +301,9 @@ public:
         }
         bool statePrefetched = false;
         while (hasCurrentTask) {
-            CopyInBeta(currentTask.seq0, currentTask.seq1, currentTask.head);
+            if (currentTask.seq1 - currentTask.seq0 <= static_cast<int64_t>(MAX_MTP)) {
+                CopyInBeta(currentTask.seq0, currentTask.seq1, currentTask.head);
+            }
             statePrefetched = ProcessHead(
                 currentTask.batch, currentTask.seq0, currentTask.seq1,
                 currentTask.head, currentTask.stateSlot, statePrefetched,
@@ -337,7 +344,7 @@ private:
             if (seqLen64 == 0) {
                 continue;
             }
-            int32_t seqLen = static_cast<int32_t>(seqLen64);
+            int64_t seqLen = seqLen64;
             if (!ValidateStateSlots(batch, seq0, seqLen)) {
                 taskValid = false;
                 return false;
@@ -360,7 +367,7 @@ private:
     __aicore__ inline bool ValidateCuSeqlens() const
     {
         if (!hasCuSeqlens_) {
-            return seqLen_ <= MAX_MTP;
+            return true;
         }
         int64_t seq0 = LoadCuSeqlens(0);
         if (seq0 != 0) {
@@ -370,7 +377,6 @@ private:
             int64_t seq1 = LoadCuSeqlens(i + 1);
             int64_t length = seq1 - seq0;
             if (seq1 < seq0 || seq1 > static_cast<int64_t>(T_) ||
-                length > static_cast<int64_t>(MAX_MTP) ||
                 (hasSsmStateIndices_ && ssmStateStride_ > 0 && length > ssmStateStride_)) {
                 return false;
             }
@@ -425,7 +431,7 @@ private:
         return static_cast<uint64_t>(stateSlot);
     }
 
-    __aicore__ inline bool ValidateStateSlots(uint64_t batchIdx, int64_t seq0, int32_t seqLen) const
+    __aicore__ inline bool ValidateStateSlots(uint64_t batchIdx, int64_t seq0, int64_t seqLen) const
     {
         if (!hasSsmStateIndices_) {
             return batchIdx < stateCapacity_;
@@ -436,7 +442,7 @@ private:
                 return false;
             }
         }
-        for (int32_t step = 0; step < seqLen; ++step) {
+        for (int64_t step = 0; step < seqLen; ++step) {
             if (LoadStateSlot(batchIdx, seq0, seq0 + step) == INVALID_STATE_SLOT) {
                 return false;
             }
@@ -444,7 +450,7 @@ private:
         return true;
     }
 
-    __aicore__ inline uint64_t ResolveInitialStateSlot(uint64_t batchIdx, int64_t seq0, int32_t seqLen) const
+    __aicore__ inline uint64_t ResolveInitialStateSlot(uint64_t batchIdx, int64_t seq0, int64_t seqLen) const
     {
         if (!hasSsmStateIndices_) {
             return batchIdx;
@@ -502,23 +508,53 @@ private:
         return 1.0f / denom;
     }
 
-    __aicore__ inline void NormalizeRows(LocalTensor<float> &tensor, int32_t seqLen)
+    __aicore__ inline void NormalizeQKRows(int32_t seqLen)
     {
-        for (int32_t row = 0; row < seqLen; ++row) {
-            uint32_t rowOffset = static_cast<uint32_t>(row) * alignK_;
-            Mul(broadTmpInUb, tensor[rowOffset], tensor[rowOffset], alignK_);
-            PipeBarrier<PIPE_V>();
-            ReduceSumDispatch(deltaInUb, broadTmpInUb, 1);
-            PipeBarrier<PIPE_V>();
-            Sqrt(deltaInUb, deltaInUb, 1);
-            PipeBarrier<PIPE_V>();
-            SyncVToS();
-            float norm = deltaInUb.GetValue(0);
-            if (norm > 0.0f) {
-                Muls(tensor[rowOffset], tensor[rowOffset], 1.0f / norm, alignK_);
-                PipeBarrier<PIPE_V>();
+        const uint32_t rows = static_cast<uint32_t>(seqLen);
+        const uint32_t elements = rows * alignK_;
+        // rows <= MAX_MTP <= vStep_: delta/attn hold all row norms.
+        Mul(preprocessTmpInUb, qInUb, qInUb, elements);
+        PipeBarrier<PIPE_V>();
+        ReduceSumDispatch(deltaInUb, preprocessTmpInUb, rows);
+        PipeBarrier<PIPE_V>();
+        Mul(preprocessTmpInUb, kInUb, kInUb, elements);
+        PipeBarrier<PIPE_V>();
+        ReduceSumDispatch(attnInUb, preprocessTmpInUb, rows);
+        PipeBarrier<PIPE_V>();
+        Adds(deltaInUb, deltaInUb, QK_L2NORM_EPS, rows);
+        Adds(attnInUb, attnInUb, QK_L2NORM_EPS, rows);
+        PipeBarrier<PIPE_V>();
+        Sqrt(deltaInUb, deltaInUb, rows);
+        Sqrt(attnInUb, attnInUb, rows);
+        PipeBarrier<PIPE_V>();
+        __ubuf__ float *qAddr = (__ubuf__ float *)qInUb.GetPhyAddr();
+        __ubuf__ float *kAddr = (__ubuf__ float *)kInUb.GetPhyAddr();
+        __ubuf__ float *qNormAddr = (__ubuf__ float *)deltaInUb.GetPhyAddr();
+        __ubuf__ float *kNormAddr = (__ubuf__ float *)attnInUb.GetPhyAddr();
+        const uint16_t rowNum = static_cast<uint16_t>(rows);
+        __VEC_SCOPE__
+        {
+            RegTensor<float> query;
+            RegTensor<float> key;
+            RegTensor<float> qNorm;
+            RegTensor<float> kNorm;
+            MaskReg full = CreateMask<float, MaskPattern::ALL>();
+            for (uint16_t row = 0; row < rowNum; ++row) {
+                DataCopy<float, LoadDist::DIST_BRC_B32>(qNorm, qNormAddr + row);
+                DataCopy<float, LoadDist::DIST_BRC_B32>(kNorm, kNormAddr + row);
+                // K=128 consists of two full registers. Keep row scaling on V
+                // rather than reading norms through a V-to-S event per window.
+                for (uint16_t col = 0; col < TWO_V_LENGTH; col += V_LENGTH) {
+                    DataCopy(query, qAddr + row * TWO_V_LENGTH + col);
+                    DataCopy(key, kAddr + row * TWO_V_LENGTH + col);
+                    Div(query, query, qNorm, full);
+                    Div(key, key, kNorm, full);
+                    DataCopy(qAddr + row * TWO_V_LENGTH + col, query, full);
+                    DataCopy(kAddr + row * TWO_V_LENGTH + col, key, full);
+                }
             }
         }
+        PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void ApplyGateInKernel(uint64_t head, int32_t seqLen)
@@ -527,10 +563,10 @@ private:
         float expA = hasALog_ ? ExpScalar(ReadFloat(aLogGm_, head)) : 1.0f;
 
         if (hasDtBias_) {
-            CopyVectorIn(broadTmpInUb, dtBiasGm_, head * realK_, realK_);
+            CopyVectorIn(preprocessTmpInUb, dtBiasGm_, head * realK_, realK_);
             SyncMte2ToV();
             for (int32_t row = 0; row < seqLen; ++row) {
-                Add(gateInUb[row * alignK_], gateInUb[row * alignK_], broadTmpInUb, alignK_);
+                Add(gateInUb[row * alignK_], gateInUb[row * alignK_], preprocessTmpInUb, alignK_);
                 PipeBarrier<PIPE_V>();
             }
         }
@@ -538,26 +574,41 @@ private:
         if (safeGate_) {
             Muls(gateInUb, gateInUb, expA, total);
             PipeBarrier<PIPE_V>();
-            Muls(broadTmpInUb, gateInUb, -1.0f, total);
+            Muls(preprocessTmpInUb, gateInUb, -1.0f, total);
             PipeBarrier<PIPE_V>();
-            Exp(broadTmpInUb, broadTmpInUb, total);
+            Exp(preprocessTmpInUb, preprocessTmpInUb, total);
             PipeBarrier<PIPE_V>();
-            Adds(broadTmpInUb, broadTmpInUb, 1.0f, total);
+            Adds(preprocessTmpInUb, preprocessTmpInUb, 1.0f, total);
             PipeBarrier<PIPE_V>();
             Duplicate(gateInUb, 1.0f, total);
             PipeBarrier<PIPE_V>();
-            Div(gateInUb, gateInUb, broadTmpInUb, total);
+            Div(gateInUb, gateInUb, preprocessTmpInUb, total);
             PipeBarrier<PIPE_V>();
             Muls(gateInUb, gateInUb, lowerBound_, total);
             PipeBarrier<PIPE_V>();
         } else {
-            Exp(gateInUb, gateInUb, total);
-            PipeBarrier<PIPE_V>();
-            Adds(gateInUb, gateInUb, 1.0f, total);
-            PipeBarrier<PIPE_V>();
-            Ln(gateInUb, gateInUb, total);
-            PipeBarrier<PIPE_V>();
-            Muls(gateInUb, gateInUb, -expA, total);
+            // softplus(x) = max(x, 0) + log1p(exp(-abs(x))).
+            __ubuf__ float *gateAddr = (__ubuf__ float *)gateInUb.GetPhyAddr();
+            const uint16_t repeats = static_cast<uint16_t>(total / V_LENGTH);
+            const float multiplier = -expA;
+            __VEC_SCOPE__
+            {
+                RegTensor<float> gate;
+                RegTensor<float> softplus;
+                MaskReg full = CreateMask<float, MaskPattern::ALL>();
+                for (uint16_t i = 0; i < repeats; ++i) {
+                    DataCopy(gate, gateAddr + i * V_LENGTH);
+                    Abs(softplus, gate, full);
+                    Muls(softplus, softplus, -1.0f, full);
+                    Exp(softplus, softplus, full);
+                    Adds(softplus, softplus, 1.0f, full);
+                    Ln(softplus, softplus, full);
+                    Maxs(gate, gate, 0.0f, full);
+                    Add(gate, gate, softplus, full);
+                    Muls(gate, gate, multiplier, full);
+                    DataCopy(gateAddr + i * V_LENGTH, gate, full);
+                }
+            }
             PipeBarrier<PIPE_V>();
         }
     }
@@ -630,8 +681,7 @@ private:
         Cast(vInUb, vLocal, AscendC::RoundMode::CAST_NONE, alignV_ * seqLen);
         AscendC::PipeBarrier<PIPE_V>();
         if (useQkL2norm_) {
-            NormalizeRows(qInUb, seqLen);
-            NormalizeRows(kInUb, seqLen);
+            NormalizeQKRows(seqLen);
         }
         Muls(qInUb, qInUb, scale_, seqLen * alignK_);
         AscendC::PipeBarrier<PIPE_V>();
@@ -1031,7 +1081,7 @@ private:
     }
 
     __aicore__ inline void Compute(uint32_t curSingleV, uint64_t curQKOffset,
-                                   uint64_t curVOffset, uint64_t betaOffset)
+                                   uint64_t curVOffset, uint64_t betaOffset, bool storeState)
     {
         if (alignK_ == TWO_V_LENGTH) {
             DecayMatVecReduce128(stateInUb, gateInUb[curQKOffset],
@@ -1059,7 +1109,7 @@ private:
             ReduceSumDispatch(attnInUb, broadTmpInUb, curSingleV);
         }
         LocalTensor<outType> attnOutLocal = attnOutQueue_.AllocTensor<outType>();
-        if (shouldStoreState_) {
+        if (storeState) {
             LocalTensor<stateType> stateOutLocal = stateOutQueue_.AllocTensor<stateType>();
             if constexpr (std::is_same<stateType, float32_t>()) {
                 DataCopy(stateOutLocal, stateInUb, alignK_ * curSingleV);
@@ -1104,6 +1154,10 @@ private:
                                              static_cast<uint32_t>(curSingleV * sizeof(stateType)),
                                              srcStride, dstStride, 0};
             DataCopyPad(finalStateGm_[stateOffset], stateTransposeLocal, stateOutParams);
+            SyncMte3ToV();
+        }
+        if (hasSsmStateIndices_ && stateVFirst_) {
+            // Consecutive speculative snapshots may target the same GM slot.
             SyncMte3ToV();
         }
         stateOutQueue_.FreeTensor(stateOutLocal);
@@ -1176,19 +1230,23 @@ private:
         return beta;
     }
 
+    __aicore__ inline void CopyInWindow(int64_t start, int64_t end, uint64_t head)
+    {
+        const uint64_t qkHead = head / (NV_ / NK_);
+        CopyInQKVGate(static_cast<uint64_t>(start) * queryTokenStride_ + qkHead * queryHeadStride_,
+                      static_cast<uint64_t>(start) * keyTokenStride_ + qkHead * keyHeadStride_,
+                      static_cast<uint64_t>(start) * valueTokenStride_ + head * valueHeadStride_,
+                      (static_cast<uint64_t>(start) * NV_ + head) * realK_,
+                      static_cast<int32_t>(end - start), head);
+    }
+
     __aicore__ inline bool ProcessHead(uint64_t batchIdx, int64_t seq0, int64_t seq1,
                                       uint64_t head_i, uint64_t stateSlot, bool statePrefetched,
                                       bool hasNextTask, uint64_t nextStateSlot, uint64_t nextHead)
     {
-        uint64_t qkHead = head_i / (NV_ / NK_);
-        uint64_t qOffset = static_cast<uint64_t>(seq0) * queryTokenStride_ + qkHead * queryHeadStride_;
-        uint64_t kOffset = static_cast<uint64_t>(seq0) * keyTokenStride_ + qkHead * keyHeadStride_;
-        uint64_t vOffset = static_cast<uint64_t>(seq0) * valueTokenStride_ + head_i * valueHeadStride_;
-        uint64_t gateOffset = (static_cast<uint64_t>(seq0) * NV_ + head_i) * realK_;
-        CopyInQKVGate(
-            qOffset, kOffset, vOffset, gateOffset, static_cast<int32_t>(seq1 - seq0), head_i);
-        if (realV_ == 0) {
-            return false;
+        const bool windowed = seq1 - seq0 > static_cast<int64_t>(MAX_MTP);
+        if (!windowed) {
+            CopyInWindow(seq0, seq1, head_i);
         }
         uint64_t nextVOffset = statePrefetched ? vStep_ : 0;
         uint32_t queuedBufferNum = statePrefetched ? 1 : 0;
@@ -1217,35 +1275,46 @@ private:
             uint64_t pendingStateSlot = 0;
             bool hasPendingAttn = false;
             bool hasPendingState = false;
-            for (int64_t seq_i = seq0; seq_i < seq1; seq_i++) {
-                uint64_t betaOffset = static_cast<uint64_t>(seq_i - seq0);
-                uint64_t curQKOffset = static_cast<uint64_t>(seq_i - seq0) * alignK_;
-                uint64_t curVOffset = static_cast<uint64_t>(seq_i - seq0) * alignV_ + v_i;
-                uint64_t attnOffset = (static_cast<uint64_t>(seq_i) * NV_ + head_i) * realV_ + v_i;
-                uint64_t curStateSlot = StateSlotForToken(batchIdx, seq0, seq_i);
-                uint64_t curStateOutSlot = curStateSlot;
-                if (alignK_ != TWO_V_LENGTH) {
-                    beta_ = LoadBeta(betaOffset);
+            for (int64_t windowStart = seq0; windowStart < seq1; windowStart += MAX_MTP) {
+                const int64_t windowEnd = windowStart + static_cast<int64_t>(MAX_MTP) < seq1 ?
+                                          windowStart + MAX_MTP : seq1;
+                if (windowed) {
+                    PipeBarrier<PIPE_V>();
+                    CopyInBeta(windowStart, windowEnd, head_i);
+                    CopyInWindow(windowStart, windowEnd, head_i);
                 }
-                Compute(curSingleV, curQKOffset, curVOffset, betaOffset);
-                if (attnOutBufferNum_ == BUFFER_NUM) {
-                    CopyOutAttn(attnOffset, curSingleV);
-                } else {
-                    if (hasPendingAttn) {
-                        CopyOutAttn(pendingAttnOffset, curSingleV);
+                for (int64_t seq_i = windowStart; seq_i < windowEnd; seq_i++) {
+                    uint64_t betaOffset = static_cast<uint64_t>(seq_i - windowStart);
+                    uint64_t curQKOffset = static_cast<uint64_t>(seq_i - windowStart) * alignK_;
+                    uint64_t curVOffset = static_cast<uint64_t>(seq_i - windowStart) * alignV_ + v_i;
+                    uint64_t attnOffset = (static_cast<uint64_t>(seq_i) * NV_ + head_i) * realV_ + v_i;
+                    uint64_t curStateSlot = StateSlotForToken(batchIdx, seq0, seq_i);
+                    uint64_t curStateOutSlot = curStateSlot;
+                    if (alignK_ != TWO_V_LENGTH) {
+                        beta_ = LoadBeta(betaOffset);
                     }
-                    pendingAttnOffset = attnOffset;
-                    hasPendingAttn = true;
-                }
-                if (shouldStoreState_) {
-                    if (stateOutBufferNum_ == BUFFER_NUM) {
-                        CopyOutState(curStateOutSlot, head_i, v_i, curSingleV);
+                    const bool storeState = shouldStoreState_ &&
+                                            (hasSsmStateIndices_ || seq_i + 1 == seq1);
+                    Compute(curSingleV, curQKOffset, curVOffset, betaOffset, storeState);
+                    if (attnOutBufferNum_ == BUFFER_NUM) {
+                        CopyOutAttn(attnOffset, curSingleV);
                     } else {
-                        if (hasPendingState) {
-                            CopyOutState(pendingStateSlot, head_i, v_i, curSingleV);
+                        if (hasPendingAttn) {
+                            CopyOutAttn(pendingAttnOffset, curSingleV);
                         }
-                        pendingStateSlot = curStateOutSlot;
-                        hasPendingState = true;
+                        pendingAttnOffset = attnOffset;
+                        hasPendingAttn = true;
+                    }
+                    if (storeState) {
+                        if (stateOutBufferNum_ == BUFFER_NUM) {
+                            CopyOutState(curStateOutSlot, head_i, v_i, curSingleV);
+                        } else {
+                            if (hasPendingState) {
+                                CopyOutState(pendingStateSlot, head_i, v_i, curSingleV);
+                            }
+                            pendingStateSlot = curStateOutSlot;
+                            hasPendingState = true;
+                        }
                     }
                 }
             }
@@ -1257,7 +1326,7 @@ private:
             }
         }
         return nextStatePrefetched;
-     }
+    }
 
 private:
     GlobalTensor<inType> queryGm_;
@@ -1296,6 +1365,7 @@ private:
     LocalTensor<float> kInUb;
     LocalTensor<float> vInUb;
     LocalTensor<float> gateInUb;
+    LocalTensor<float> preprocessTmpInUb;
     LocalTensor<float> betaInUb;
     LocalTensor<float> deltaInUb;
     LocalTensor<float> broadTmpInUb;

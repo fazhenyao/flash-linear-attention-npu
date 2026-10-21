@@ -46,7 +46,6 @@ static constexpr size_t RKDA_DIM_3 = 3;
 
 static constexpr uint32_t RKDA_LAYOUT_BSND = 0;
 static constexpr uint32_t RKDA_LAYOUT_TND = 1;
-// A2/A3 input window capacity; A5 retains its sequence-length limit.
 static constexpr size_t RKDA_MAX_MTP = 8;
 static constexpr int64_t RKDA_INPUT_BUFFER_NUM = 2;
 static constexpr int64_t RKDA_UB_GUARD_BYTES = 2048;
@@ -624,11 +623,6 @@ private:
         }
         uint64_t maxCoreNum = (ctx_.aivNum > 0) ? ctx_.aivNum : 1;
         uint64_t selectedCoreNum = (taskUnits < maxCoreNum) ? taskUnits : maxCoreNum;
-        if (ctx_.isA5 == 0) {
-            // Keep the minimum wave count while avoiding partially filled cores.
-            const uint64_t tasksPerCore = (taskUnits + maxCoreNum - 1) / maxCoreNum;
-            selectedCoreNum = (taskUnits + tasksPerCore - 1) / tasksPerCore;
-        }
         tiling.vectorCoreNum = static_cast<uint32_t>(selectedCoreNum);
         OP_LOGD(ctx_.nodeName, "taskUnits: [%llu], selected vectorCoreNum: [%u]",
                 static_cast<unsigned long long>(taskUnits), tiling.vectorCoreNum);
@@ -643,16 +637,15 @@ private:
 
     ge::graphStatus RuleFillTilingShapeData(RecurrentKdaTilingData &tiling) const
     {
-        if (ctx_.isA5 == 0) {
-            // Long-sequence offsets are 64-bit, but serialized capacities remain uint32.
+        if (ctx_.isA5 != 0) {
             const int64_t maxCapacity = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
             const int64_t seqLen = ctx_.queryShape.GetDim(
                 ctx_.layout == RKDA_LAYOUT_TND ? RKDA_DIM_0 : RKDA_DIM_1);
             const int64_t batch = ctx_.layout == RKDA_LAYOUT_TND ? 1 :
                                   ctx_.queryShape.GetDim(RKDA_DIM_0);
-            const int64_t seqNum = SeqNum(ctx_.queryShape, ctx_.cuSeqlensShape);
             OP_CHECK_IF(seqLen > maxCapacity || batch > maxCapacity / seqLen ||
-                            seqNum > maxCapacity || ctx_.stateShape.GetDim(RKDA_DIM_0) > maxCapacity ||
+                            SeqNum(ctx_.queryShape, ctx_.cuSeqlensShape) > maxCapacity ||
+                            ctx_.stateShape.GetDim(RKDA_DIM_0) > maxCapacity ||
                             (ctx_.hasSsmStateIndices &&
                              ctx_.ssmStateShape.GetDimNum() == RKDA_METADATA_RANK2 &&
                              ctx_.ssmStateShape.GetDim(RKDA_DIM_1) > maxCapacity),
@@ -674,22 +667,25 @@ private:
         return ge::GRAPH_SUCCESS;
     }
 
-    int64_t CalcFixedUbBytes(int64_t aNv, int64_t aDv, int64_t aDk, uint32_t nv) const
+    int64_t CalcFixedUbBytes(int64_t aNv, int64_t aDv, int64_t aDk) const
     {
-        const int64_t rawBytes = RKDA_MAX_MTP * (8 * aDk + 2 * aDv);
-        const int64_t rawBufferNum = ctx_.isA5 != 0 ? 1 : 2;
-        const int64_t betaHeads = ctx_.isA5 != 0 ? aNv : static_cast<int64_t>(nv);
-        int64_t usedUbBytes = rawBufferNum * rawBytes;
-        usedUbBytes += RKDA_MAX_MTP * 4 * betaHeads;
-        usedUbBytes += 64 + RKDA_UB_GUARD_BYTES;
+        int64_t usedUbBytes = 0;
+        usedUbBytes += RKDA_MAX_MTP * (4 * aDk + 2 * aDv);   // q/k/v input queues, bf16.
+        usedUbBytes += RKDA_MAX_MTP * 4 * aDk;               // gate input queue, fp32.
+        const int64_t betaWidth = ctx_.isA5 != 0 ? 16 : aNv;
+        usedUbBytes += RKDA_MAX_MTP * 4 * betaWidth;         // A5 loads one head, padded to 16.
+        usedUbBytes += 64 + RKDA_UB_GUARD_BYTES;             // scalar buffer and guard.
         return usedUbBytes;
     }
 
-    int64_t CalcWorkingUbBytes(int64_t aNv, int64_t aDv, int64_t aDk, uint32_t nv) const
+    int64_t CalcWorkingUbBytes(int64_t aNv, int64_t aDv, int64_t aDk) const
     {
-        const int64_t betaHeads = ctx_.isA5 != 0 ? aNv : static_cast<int64_t>(nv);
-        int64_t usedUbBytes = CalcFixedUbBytes(aNv, aDv, aDk, nv);
-        usedUbBytes += RKDA_MAX_MTP * (4 * aDv + 12 * aDk + 4 * betaHeads);
+        int64_t usedUbBytes = CalcFixedUbBytes(aNv, aDv, aDk);
+        const int64_t betaWidth = ctx_.isA5 != 0 ? 16 : aNv;
+        usedUbBytes += RKDA_MAX_MTP * (4 * aDv + 12 * aDk + 4 * betaWidth);
+        if (ctx_.isA5 != 0) {
+            usedUbBytes += RKDA_MAX_MTP * 4 * aDk; // Preprocessing cannot alias live state.
+        }
         return usedUbBytes;
     }
 
@@ -790,16 +786,6 @@ private:
             OP_LOGE(ctx_.nodeName, "ubRestBytes should be non-negative, but got %ld", ubRestBytes);
             return ge::GRAPH_FAILED;
         }
-        if (ctx_.isA5 == 0) {
-            const int64_t tmpBytes = ubCalcCtx.workingUbBytes - ubCalcCtx.fixedUbBytes +
-                                     CalcComputeUbCoeff(aDk) * static_cast<int64_t>(selected.vStep);
-            if (tmpBytes > ubRestBytes) {
-                OP_LOGE(ctx_.nodeName, "packed input buffers exceed the UB budget");
-                return ge::GRAPH_FAILED;
-            }
-            // Generic A2/A3 kernels allocate only named live scratch slices.
-            ubRestBytes = tmpBytes;
-        }
         tiling.ubCalSize = static_cast<uint32_t>(ctx_.ubSize);
         tiling.vStep = selected.vStep;
         tiling.stateOutBufferNum = selected.stateOutBufferNum;
@@ -819,7 +805,7 @@ private:
 
     ge::graphStatus RuleCalcFixedUbBytes(RecurrentKdaTilingData &tiling, UbCalcContext &ubCalcCtx) const
     {
-        ubCalcCtx.fixedUbBytes = CalcFixedUbBytes(ubCalcCtx.aNv, ubCalcCtx.aDv, ubCalcCtx.aDk, tiling.nv);
+        ubCalcCtx.fixedUbBytes = CalcFixedUbBytes(ubCalcCtx.aNv, ubCalcCtx.aDv, ubCalcCtx.aDk);
         tiling.ubRestBytes = static_cast<uint32_t>(ubCalcCtx.ubSize - ubCalcCtx.fixedUbBytes);
         return ge::GRAPH_SUCCESS;
     }
@@ -827,7 +813,7 @@ private:
     ge::graphStatus RuleCalcWorkingUbBytes(RecurrentKdaTilingData &tiling, UbCalcContext &ubCalcCtx) const
     {
         (void)tiling;
-        ubCalcCtx.workingUbBytes = CalcWorkingUbBytes(ubCalcCtx.aNv, ubCalcCtx.aDv, ubCalcCtx.aDk, tiling.nv);
+        ubCalcCtx.workingUbBytes = CalcWorkingUbBytes(ubCalcCtx.aNv, ubCalcCtx.aDv, ubCalcCtx.aDk);
         return ge::GRAPH_SUCCESS;
     }
 
