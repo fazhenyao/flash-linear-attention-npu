@@ -71,6 +71,7 @@ struct alignas(8) RecurrentKdaTilingData {
     uint64_t keyHeadStride;
     uint64_t valueTokenStride;
     uint64_t valueHeadStride;
+    uint32_t windowSize; // A5 token capacity selected by host tiling; A2/A3 ignore it.
 };
 #pragma pack(pop)
 

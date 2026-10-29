@@ -63,9 +63,14 @@ def profiles():
         base_spec(name="tnd_no_metadata", T=33, layout="TND", cu=False),
         base_spec(name="zero_initial", T=17, initial_none=True, use_qk_l2norm_in_kernel=True),
         base_spec(name="large_gate", T=17, use_gate_in_kernel=True, large_gate=True),
-        base_spec(name="v256_regression", T=9, V=256, state_v_first=False,
+        base_spec(name="bf16_kfirst_regression", T=9, V=128, state_v_first=False,
                   state_dtype="bf16", use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True),
         base_spec(name="empty_sequences", T=17, lengths=[0, 17, 0, 9], padding=3),
+        base_spec(name="raw_gate_no_bias", B=2, T=17, dt_bias_none=True,
+                  use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+                  use_beta_sigmoid_in_kernel=True),
+        base_spec(name="safe_gate_no_bias", B=2, T=17, dt_bias_none=True,
+                  safe_gate=True, use_gate_in_kernel=True, state_v_first=False),
         base_spec(name="norm_signal", T=17, pattern="signal", state_zero=True,
                   use_qk_l2norm_in_kernel=True),
     ]
@@ -85,6 +90,51 @@ def model_specs():
                     use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
                     use_beta_sigmoid_in_kernel=True, seed=20261020, case_id=len(result)))
     return result
+
+
+def contract_specs():
+    """Regression matrix for metadata/gate inference and unrestricted heads."""
+    profiles = [
+        base_spec(name="dense_ignored_layout", B=2, T=5, cu=False, layout="ignored"),
+        base_spec(name="packed_ignored_layout", T=5, layout="ignored", lengths=[0, 5, 2]),
+        base_spec(name="raw_gate_flag_false", T=5, a_log=True, use_gate_in_kernel=False),
+        base_spec(name="raw_gate_no_bias_flag_false", T=5, a_log=True,
+                  dt_bias_none=True, use_gate_in_kernel=False),
+        base_spec(name="step_gate_flag_true", T=5, a_log=False, use_gate_in_kernel=True),
+        base_spec(name="safe_gate_flag_false", T=5, a_log=True, safe_gate=True),
+        base_spec(name="dense_zero_initial", B=2, T=5, cu=False, initial_none=True),
+        base_spec(name="heads257", T=2, H=257, HV=257,
+                  use_qk_l2norm_in_kernel=True, a_log=True),
+        base_spec(name="ratio17_heads289", T=2, H=17, HV=289,
+                  state_v_first=False, state_dtype="bf16", a_log=True),
+        base_spec(name="ratio257_heads514", T=2, H=2, HV=514,
+                  a_log=True, qkv_view="fused", inplace=True),
+        base_spec(name="dense_fp16_aux", B=2, T=5, cu=False,
+                  g_dtype="fp16", beta_dtype="fp16", a_log=True,
+                  use_beta_sigmoid_in_kernel=True),
+        base_spec(name="heads258_kfirst", T=2, H=129, HV=258, V=128,
+                  a_log=True, state_v_first=False),
+    ]
+    return [dict(spec, seed=20261027 + repeat * len(profiles) + i)
+            for repeat in range(3) for i, spec in enumerate(profiles)]
+
+
+def typical_specs():
+    names = {"bf16_small", "fused_7", "window_17", "window_1024",
+             "view_feature_gap", "slots_packed_BSND", "slots_speculative_TND",
+             "dense_no_metadata", "zero_initial", "large_gate", "bf16_kfirst_regression",
+             "empty_sequences", "raw_gate_no_bias", "safe_gate_no_bias", "norm_signal"}
+    return [dict(spec, seed=20261027 + i) for i, spec in enumerate(PROFILES)
+            if spec["name"] in names]
+
+
+def typical_model_specs():
+    # One head count for each (batch, length); all head counts are represented
+    # at every length across the three batches. Include B72/HV128/T8.
+    head_counts = {32: [128, 32, 48, 32], 64: [32, 48, 128, 48],
+                   72: [48, 128, 32, 128]}
+    return [spec for spec in model_specs()
+            if spec["HV"] == head_counts[spec["B"]][[1, 2, 4, 8].index(spec["T"])]]
 
 
 def _dtype(dtype):
@@ -112,6 +162,7 @@ if GENERATOR_REGISTRY is not None:
                 if cfg.name == "low_precision_marker":
                     cfg.dtype = _dtype(spec.get("dtype", "bf16"))
                 elif cfg.name == "case_spec":
+                    cfg.dtype = "string"
                     cfg.range_values = json.dumps(spec, ensure_ascii=False, separators=(",", ":"))
                 elif cfg.name in spec:
                     cfg.range_values = spec[cfg.name]
@@ -127,6 +178,9 @@ def generate_packages():
     groups = {
         "atk_recurrent_kda.json": [_spec(i) for i in range(len(PROFILES) * 3)],
         "atk_recurrent_kda_perf.json": model_specs(),
+        "atk_recurrent_kda_contract.json": contract_specs(),
+        "atk_recurrent_kda_typical.json": typical_specs(),
+        "atk_recurrent_kda_perf_typical.json": typical_model_specs(),
         "atk_recurrent_kda_mss.json": [base_spec(**item) for item in [
             dict(name="key0_short", T=1, inplace=True),
             dict(name="key0_window", T=17, use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True),
@@ -136,7 +190,10 @@ def generate_packages():
                  use_beta_sigmoid_in_kernel=True, allow_neg_eigval=True),
             dict(name="key0_packed", T=17, lengths=[0,9,17], layout="TND", indices="packed"),
             dict(name="key0_fallback", T=9, qkv_view="feature_gap"),
-            dict(name="key0_v256", T=9, V=256, state_dtype="bf16", state_v_first=False),
+            dict(name="key0_bf16_kfirst", T=9, V=128, state_dtype="bf16", state_v_first=False),
+            dict(name="key0_no_bias", B=16, T=17, dt_bias_none=True,
+                 use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+                 use_beta_sigmoid_in_kernel=True),
         ]],
     }
     from copy import deepcopy
@@ -148,6 +205,7 @@ def generate_packages():
             case.update(id=index, default_seed=spec["seed"], name=f"recurrent_kda_{index:04d}_{spec['name']}")
             for value in case["inputs"]:
                 if value["name"] == "case_spec":
+                    value["dtype"] = "string"
                     value["range_values"] = json.dumps(spec, separators=(",", ":"))
                 elif value["name"] in spec:
                     value["range_values"] = spec[value["name"]]

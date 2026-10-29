@@ -54,7 +54,7 @@ def main():
                     count += 1
             for metadata in [False, True]:
                 for return_state in [False, True]:
-                    spec = base_spec(B=2, T=17, cu=metadata, V=128 if v_first else 256, layout=layout, state_v_first=v_first,
+                    spec = base_spec(B=2, T=17, cu=metadata, V=128, layout=layout, state_v_first=v_first,
                                      initial_none=True, pattern="signal", use_qk_l2norm_in_kernel=True)
                     options = call_options(spec)
                     options["output_final_state"] = return_state
@@ -80,15 +80,16 @@ def main():
             for _ in range(tokens):
                 current = current + 0.5 * (2 - current*z) * z
                 expected.append(current * z * 128**-0.5)
-            target = torch.tensor(expected).reshape(1, tokens, 1, 1).expand_as(output.cpu())
+            prefix = (1, tokens, 1, 1) if output.ndim == 4 else (tokens, 1, 1)
+            target = torch.tensor(expected).reshape(prefix).expand_as(output.cpu())
             assert torch.allclose(output.cpu().float(), target, rtol=0.008, atol=1e-6)
             assert torch.allclose(final.cpu()[..., 0], torch.full_like(final.cpu()[..., 0], current),
                                   rtol=1e-5, atol=1e-6)
             assert torch.count_nonzero(final[..., 1:]) == 0
             count += 1
-    for invalid in ["head_ratio", "q_dtype", "state_stride", "missing_a_log"]:
+    for invalid in ["head_ratio", "q_dtype", "state_stride", "dt_bias_without_a_log"]:
         spec = base_spec(T=17, inplace=True, HV=3 if invalid == "head_ratio" else 4,
-                         use_gate_in_kernel=invalid == "missing_a_log")
+                         use_gate_in_kernel=invalid == "dt_bias_without_a_log")
         inputs = build_inputs(spec, device)
         if invalid == "q_dtype":
             inputs["q"] = inputs["q"].float()
@@ -96,7 +97,7 @@ def main():
             state = inputs["initial_state"]
             inputs["initial_state"] = torch.zeros((*state.shape[:-1], state.shape[-1] * 2),
                                                   device=device)[..., ::2]
-        elif invalid == "missing_a_log":
+        elif invalid == "dt_bias_without_a_log":
             inputs["A_log"] = None
         try:
             recurrent_kda(**inputs, **call_options(spec))

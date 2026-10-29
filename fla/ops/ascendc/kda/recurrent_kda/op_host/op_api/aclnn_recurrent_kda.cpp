@@ -23,6 +23,7 @@
 #include "opdev/tensor_view_utils.h"
 
 #include <cstring>
+#include <algorithm>
 #include <limits>
 
 using namespace op;
@@ -131,20 +132,6 @@ static bool SameTensorView(const aclTensor *lhs, const aclTensor *rhs)
            SameViewStrides(lhs, rhs);
 }
 
-static bool ParseLayout(const char *layout, RecurrentKdaLayout &parsed)
-{
-    if (layout == nullptr || std::strcmp(layout, "BSND") == 0) {
-        parsed = RecurrentKdaLayout::BSND;
-        return true;
-    }
-    if (std::strcmp(layout, "TND") == 0) {
-        parsed = RecurrentKdaLayout::TND;
-        return true;
-    }
-    OP_LOGE(ACLNN_ERR_PARAM_INVALID, "npu_recurrent_kda: layout must be BSND or TND.");
-    return false;
-}
-
 bool IsSupportedQkvView(const aclTensor *tensor, RecurrentKdaLayout layout)
 {
     if (tensor == nullptr) {
@@ -168,15 +155,22 @@ bool IsSupportedQkvView(const aclTensor *tensor, RecurrentKdaLayout layout)
     const int64_t featureCount = Dim(tensor, featureDim);
     const int64_t tokenStride = strides[tokenDim];
     const int64_t headStride = strides[headDim];
-    if (strides[featureDim] != 1 || headStride < featureCount) {
+    const int64_t tokenCount = Dim(tensor, tokenDim);
+    if (strides[featureDim] != 1 || tokenStride < featureCount || headStride < featureCount) {
         return false;
     }
     const int64_t maxInt64 = std::numeric_limits<int64_t>::max();
     if (headCount > 1 && headStride > (maxInt64 - featureCount) / (headCount - 1)) {
         return false;
     }
-    const int64_t minTokenStride = (headCount - 1) * headStride + featureCount;
-    if (tokenStride < minTokenStride) {
+    if (tokenCount > 1 && tokenStride > (maxInt64 - featureCount) / (tokenCount - 1)) {
+        return false;
+    }
+    const int64_t tokenMajorSpan = (headCount - 1) * headStride + featureCount;
+    const int64_t headMajorSpan = (tokenCount - 1) * tokenStride + featureCount;
+    const bool tokenMajor = tokenStride >= tokenMajorSpan;
+    const bool headMajor = headStride >= headMajorSpan;
+    if (!tokenMajor && !headMajor) {
         return false;
     }
     const uint64_t srcGapElements = static_cast<uint64_t>(tokenStride - featureCount);
@@ -184,9 +178,11 @@ bool IsSupportedQkvView(const aclTensor *tensor, RecurrentKdaLayout layout)
         return false;
     }
 
+    // The kernel flattens BSND batches only for token-major storage.  A
+    // legal BSND head-major view is materialized by ACLNN instead.
     if (layout == RecurrentKdaLayout::BSND && Dim(tensor, DIM0) > 1) {
         const int64_t seqLen = Dim(tensor, DIM1);
-        if (tokenStride > maxInt64 / seqLen || strides[DIM0] != seqLen * tokenStride) {
+        if (!tokenMajor || tokenStride > maxInt64 / seqLen || strides[DIM0] != seqLen * tokenStride) {
             return false;
         }
     }
@@ -212,16 +208,30 @@ bool CheckQkvMaterializationSafety(
         tokenStride < featureCount || headStride < featureCount) {
         return true;
     }
+    const int64_t tokenCount = Dim(tensor, tokenDim);
     const int64_t maxInt64 = std::numeric_limits<int64_t>::max();
     if (headCount > 1 && headStride > (maxInt64 - featureCount) / (headCount - 1)) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "npu_recurrent_kda: %s head span overflows.", name);
         return false;
     }
-    const int64_t minTokenStride = (headCount - 1) * headStride + featureCount;
-    if (tokenStride < minTokenStride) {
-        OP_LOGE(ACLNN_ERR_PARAM_INVALID,
-                "npu_recurrent_kda: %s token/head axis order or overlap is unsupported.", name);
+    if (tokenCount > 1 && tokenStride > (maxInt64 - featureCount) / (tokenCount - 1)) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "npu_recurrent_kda: %s token span overflows.", name);
         return false;
+    }
+    const int64_t tokenMajorSpan = (headCount - 1) * headStride + featureCount;
+    const int64_t headMajorSpan = (tokenCount - 1) * tokenStride + featureCount;
+    if (tokenStride < tokenMajorSpan && headStride < headMajorSpan) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID,
+                "npu_recurrent_kda: %s token/head axes overlap.", name);
+        return false;
+    }
+    if (layout == RecurrentKdaLayout::BSND && Dim(tensor, DIM0) > 1) {
+        const int64_t batchSpan = std::max(tokenMajorSpan, headMajorSpan);
+        if (strides[DIM0] < batchSpan) {
+            OP_LOGE(ACLNN_ERR_PARAM_INVALID,
+                    "npu_recurrent_kda: %s batch stride overlaps the view.", name);
+            return false;
+        }
     }
     return true;
 }
@@ -239,7 +249,7 @@ bool CheckCuSeqlensShape(const aclTensor *cuSeqlens, const char *opName)
     return true;
 }
 
-bool CheckShape(const RecurrentKdaParams &params, RecurrentKdaLayout layout)
+bool CheckShape(const RecurrentKdaParams &params, bool varlen)
 {
     if (!SameShape(params.query, params.key)) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "npu_recurrent_kda: query and key must have identical shape.");
@@ -252,7 +262,7 @@ bool CheckShape(const RecurrentKdaParams &params, RecurrentKdaLayout layout)
     int64_t hv = 0;
     int64_t kDim = 0;
     int64_t vDim = 0;
-    if (layout == RecurrentKdaLayout::TND) {
+    if (varlen) {
         if (Rank(params.query) != 3 || Rank(params.value) != 3 || Rank(params.gate) != 3 || Rank(params.beta) != 2) {
             OP_LOGE(ACLNN_ERR_PARAM_INVALID,
                     "npu_recurrent_kda: TND expects q/k [T,H,K], v [T,HV,V], g [T,HV,K], beta [T,HV].");
@@ -309,9 +319,7 @@ bool CheckShape(const RecurrentKdaParams &params, RecurrentKdaLayout layout)
     if (!CheckCuSeqlensShape(params.cuSeqlensOptional, "npu_recurrent_kda")) {
         return false;
     }
-    int64_t seqNum = params.cuSeqlensOptional == nullptr ?
-        ((layout == RecurrentKdaLayout::BSND) ? batch : 1) :
-        Dim(params.cuSeqlensOptional, DIM0) - 1;
+    int64_t seqNum = varlen ? Dim(params.cuSeqlensOptional, DIM0) - 1 : batch;
     if (Rank(params.initialStateRef) != 4) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "npu_recurrent_kda: initialStateRef must be rank 4.");
         return false;
@@ -351,13 +359,12 @@ bool CheckShape(const RecurrentKdaParams &params, RecurrentKdaLayout layout)
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "npu_recurrent_kda: num_accepted_tokens length must equal sequence number.");
         return false;
     }
-    if (params.useGateInKernel && params.aLogOptional == nullptr) {
-        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "npu_recurrent_kda: A_log is required when use_gate_in_kernel=True.");
-        return false;
-    }
-    if (!params.useGateInKernel && (params.safeGate || params.aLogOptional != nullptr || params.dtBiasOptional != nullptr)) {
+    // Gate mode is determined solely by A_log presence.  The legacy
+    // use_gate_in_kernel attribute is retained for ABI compatibility and is
+    // intentionally ignored by the numeric path.
+    if (params.aLogOptional == nullptr && (params.safeGate || params.dtBiasOptional != nullptr)) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID,
-                "npu_recurrent_kda: A_log, dt_bias and safe_gate require use_gate_in_kernel=True.");
+                "npu_recurrent_kda: dt_bias and safe_gate require A_log to be passed.");
         return false;
     }
     if (params.aLogOptional != nullptr && (Rank(params.aLogOptional) != 1 || Dim(params.aLogOptional, DIM0) != hv)) {
@@ -557,9 +564,11 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
 
     CHECK_RET(CheckNotNull(params), ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckDtypeValid(params), ACLNN_ERR_PARAM_INVALID);
-    RecurrentKdaLayout parsedLayout = RecurrentKdaLayout::BSND;
-    CHECK_RET(ParseLayout(params.layout, parsedLayout), ACLNN_ERR_PARAM_INVALID);
-    CHECK_RET(CheckShape(params, parsedLayout), ACLNN_ERR_PARAM_INVALID);
+    // `cu_seqlens` is the only mode discriminator.  `layout` remains a
+    // compatibility argument and does not affect rank or address semantics.
+    const bool varlen = params.cuSeqlensOptional != nullptr;
+    const RecurrentKdaLayout parsedLayout = varlen ? RecurrentKdaLayout::TND : RecurrentKdaLayout::BSND;
+    CHECK_RET(CheckShape(params, varlen), ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckQkvMaterializationSafety(params.query, parsedLayout, "query") &&
                   CheckQkvMaterializationSafety(params.key, parsedLayout, "key") &&
                   CheckQkvMaterializationSafety(params.value, parsedLayout, "value"),
@@ -610,9 +619,10 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     auto result = l0op::RecurrentKda(
         params.query, params.key, params.value, params.gate, params.beta, initialStateForKernel,
         params.cuSeqlensOptional, params.ssmStateIndicesOptional, params.aLogOptional,
-        params.dtBiasOptional, params.numAcceptedTokensOptional, params.layout, params.scale,
+        params.dtBiasOptional, params.numAcceptedTokensOptional,
+        params.layout == nullptr ? "BSND" : params.layout, params.scale,
         params.outputFinalState, params.inplaceFinalState, params.useQkL2normInKernel,
-        params.useGateInKernel, params.useBetaSigmoidInKernel, params.allowNegEigval,
+        params.aLogOptional != nullptr, params.useBetaSigmoidInKernel, params.allowNegEigval,
         params.safeGate, params.lowerBound, params.stateVFirst, params.attnOut,
         finalStateForKernel, executorPtr);
     CHECK_RET(result[0] != nullptr && result[1] != nullptr && result[2] != nullptr,

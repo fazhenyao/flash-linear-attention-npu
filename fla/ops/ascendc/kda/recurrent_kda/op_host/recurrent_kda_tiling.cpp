@@ -154,14 +154,14 @@ RecurrentKdaTilingContext RecurrentKdaTiling::BuildProcessorContext() const
     }
     ctx.scale = tilingData_.scale;
     ctx.lowerBound = tilingData_.lowerBound;
-    ctx.layout = tilingData_.layout;
     ctx.hasCuSeqlens = tilingData_.hasCuSeqlens;
+    ctx.layout = ctx.hasCuSeqlens ? RKDA_LAYOUT_TND : RKDA_LAYOUT_BSND;
     ctx.hasSsmStateIndices = tilingData_.hasSsmStateIndices;
     ctx.hasALog = tilingData_.hasALog;
     ctx.hasDtBias = tilingData_.hasDtBias;
     ctx.hasAcceptedTokens = tilingData_.hasAcceptedTokens;
     ctx.useQkL2norm = tilingData_.useQkL2norm;
-    ctx.useGateInKernel = tilingData_.useGateInKernel;
+    ctx.useGateInKernel = ctx.hasALog;
     ctx.useBetaSigmoid = tilingData_.useBetaSigmoid;
     ctx.allowNegEigval = tilingData_.allowNegEigval;
     ctx.safeGate = tilingData_.safeGate;
@@ -358,20 +358,18 @@ ge::graphStatus RecurrentKdaTiling::GetAttrsInfo()
 {
     auto attrs = context_->GetAttrs();
     OP_CHECK_IF(attrs == nullptr, OP_LOGE(context_->GetNodeName(), "attrs is null"), return ge::GRAPH_FAILED);
-    const char *layout = attrs->GetAttrPointer<char>(ATTR_LAYOUT_INDEX);
-    if (layout == nullptr || std::strcmp(layout, "BSND") == 0) {
-        tilingData_.layout = RKDA_LAYOUT_BSND;
-    } else if (std::strcmp(layout, "TND") == 0) {
-        tilingData_.layout = RKDA_LAYOUT_TND;
-    } else {
-        OP_LOGE(context_->GetNodeName(), "layout must be BSND or TND for RecurrentKda, got %s", layout);
-        return ge::GRAPH_FAILED;
-    }
+    // `layout` is retained in the public ABI for compatibility.  The
+    // physical mode is inferred from whether cu_seqlens was supplied.
+    // Fixed-length inputs use rank-4 BSND addressing; packed varlen inputs
+    // use rank-3 TND addressing regardless of the attribute value.
+    tilingData_.layout = tilingData_.hasCuSeqlens ? RKDA_LAYOUT_TND : RKDA_LAYOUT_BSND;
     tilingData_.scale = *attrs->GetAttrPointer<float>(ATTR_SCALE_INDEX);
     tilingData_.outputFinalState = *attrs->GetAttrPointer<bool>(ATTR_OUTPUT_FINAL_STATE_INDEX) ? 1 : 0;
     tilingData_.inplaceFinalState = *attrs->GetAttrPointer<bool>(ATTR_INPLACE_FINAL_STATE_INDEX) ? 1 : 0;
     tilingData_.useQkL2norm = *attrs->GetAttrPointer<bool>(ATTR_USE_QK_L2NORM_INDEX) ? 1 : 0;
-    tilingData_.useGateInKernel = *attrs->GetAttrPointer<bool>(ATTR_USE_GATE_INDEX) ? 1 : 0;
+    // A_log presence is the authoritative gate mode.  Keep the legacy
+    // attribute in the tiling record only as a compatibility field.
+    tilingData_.useGateInKernel = tilingData_.hasALog ? 1 : 0;
     tilingData_.useBetaSigmoid = *attrs->GetAttrPointer<bool>(ATTR_USE_BETA_SIGMOID_INDEX) ? 1 : 0;
     tilingData_.allowNegEigval = *attrs->GetAttrPointer<bool>(ATTR_ALLOW_NEG_EIGVAL_INDEX) ? 1 : 0;
     tilingData_.safeGate = *attrs->GetAttrPointer<bool>(ATTR_SAFE_GATE_INDEX) ? 1 : 0;

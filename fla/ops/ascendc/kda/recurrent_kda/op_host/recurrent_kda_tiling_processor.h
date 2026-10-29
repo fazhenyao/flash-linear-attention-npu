@@ -21,6 +21,7 @@
 #include "register/op_impl_registry.h"
 #include "tiling/tiling_api.h"
 #include "util/math_util.h"
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -47,6 +48,7 @@ static constexpr size_t RKDA_DIM_3 = 3;
 static constexpr uint32_t RKDA_LAYOUT_BSND = 0;
 static constexpr uint32_t RKDA_LAYOUT_TND = 1;
 static constexpr size_t RKDA_MAX_MTP = 8;
+static constexpr size_t RKDA_A5_MAX_MTP = 4;
 static constexpr int64_t RKDA_INPUT_BUFFER_NUM = 2;
 static constexpr int64_t RKDA_UB_GUARD_BYTES = 2048;
 static constexpr size_t RKDA_SYS_WORKSPACE_SIZE = 16U * 1024U * 1024U;
@@ -109,6 +111,24 @@ public:
 
     ge::graphStatus ProcessShapes(RecurrentKdaTilingData &tiling) const
     {
+        // Validate byte products before dense-stride and device-field arithmetic.
+        if (ctx_.isA5 != 0) {
+            const uint64_t limit = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+            const std::array<const gert::Shape *, 6> shapes = {{
+                &ctx_.queryShape, &ctx_.keyShape, &ctx_.valueShape,
+                &ctx_.gateShape, &ctx_.betaShape, &ctx_.stateShape}};
+            for (const auto *shape : shapes) {
+                uint64_t bytes = 4; // Conservative maximum element width.
+                for (size_t axis = 0; axis < shape->GetDimNum(); ++axis) {
+                    const uint64_t dim = static_cast<uint64_t>(shape->GetDim(axis));
+                    OP_CHECK_IF(dim == 0 || bytes > limit / dim,
+                                OP_LOGE(ctx_.nodeName, "Tensor byte size exceeds the signed device address range."),
+                                return ge::GRAPH_FAILED);
+                    bytes *= dim;
+                }
+            }
+        }
+
         tiling.vectorCoreNum = static_cast<uint32_t>(ctx_.aivNum);
 
         struct RuleItem {
@@ -131,6 +151,9 @@ public:
 
     ge::graphStatus ProcessUb(RecurrentKdaTilingData &tiling) const
     {
+        if (ctx_.isA5 != 0) {
+            return PlanA5Ub(tiling);
+        }
         struct RuleItem {
             const char *name;
             ge::graphStatus (RecurrentKdaTilingProcessor::*fn)(RecurrentKdaTilingData &, UbCalcContext &) const;
@@ -237,12 +260,17 @@ private:
                         headStride > (maxUint64 - featureCount) / (headCount - 1),
                     OP_LOGE(ctx_.nodeName, "%s head stride calculation overflows.", name),
                     return ge::GRAPH_FAILED);
-        const uint64_t minTokenStride = (headCount - 1) * headStride + featureCount;
-        OP_CHECK_IF(tokenStride < minTokenStride,
-                    OP_LOGE(ctx_.nodeName,
-                            "%s token stride overlaps heads: token stride=%llu, minimum=%llu.",
-                            name, static_cast<unsigned long long>(tokenStride),
-                            static_cast<unsigned long long>(minTokenStride)),
+        const uint64_t tokenCount = static_cast<uint64_t>(shape.GetDim(tokenDim));
+        OP_CHECK_IF(tokenCount > 1 &&
+                        tokenStride > (maxUint64 - featureCount) / (tokenCount - 1),
+                    OP_LOGE(ctx_.nodeName, "%s token span calculation overflows.", name),
+                    return ge::GRAPH_FAILED);
+        const uint64_t tokenMajorSpan = (headCount - 1) * headStride + featureCount;
+        const uint64_t headMajorSpan = (tokenCount - 1) * tokenStride + featureCount;
+        const bool tokenMajor = tokenStride >= tokenMajorSpan;
+        const bool headMajor = headStride >= headMajorSpan;
+        OP_CHECK_IF(!tokenMajor && !headMajor,
+                    OP_LOGE(ctx_.nodeName, "%s token/head axes overlap.", name),
                     return ge::GRAPH_FAILED);
 
         const uint64_t srcGapElements = tokenStride - featureCount;
@@ -258,12 +286,16 @@ private:
                         OP_LOGE(ctx_.nodeName, "%s batch stride calculation overflows.", name),
                         return ge::GRAPH_FAILED);
             const uint64_t expectedBatchStride = seqLen * tokenStride;
-            OP_CHECK_IF(static_cast<uint64_t>(strides[RKDA_DIM_0]) != expectedBatchStride,
+            OP_CHECK_IF(tokenMajor && static_cast<uint64_t>(strides[RKDA_DIM_0]) != expectedBatchStride,
                         OP_LOGE(ctx_.nodeName,
                                 "%s batch stride must equal T * token stride for flattened BSND, "
                                 "but got %llu and expected %llu.",
                                 name, static_cast<unsigned long long>(strides[RKDA_DIM_0]),
                                 static_cast<unsigned long long>(expectedBatchStride)),
+                        return ge::GRAPH_FAILED);
+            OP_CHECK_IF(!tokenMajor && static_cast<uint64_t>(strides[RKDA_DIM_0]) <
+                                     std::max(tokenMajorSpan, headMajorSpan),
+                        OP_LOGE(ctx_.nodeName, "%s batch stride overlaps the view.", name),
                         return ge::GRAPH_FAILED);
         }
         return ge::GRAPH_SUCCESS;
@@ -394,10 +426,9 @@ private:
 
     ge::graphStatus CheckOptionalGateShapes(int64_t hvNum, int64_t kDim) const
     {
-        if (ctx_.useGateInKernel && !ctx_.hasALog) {
-            OP_LOGE(ctx_.nodeName, "A_log is required when use_gate_in_kernel is true.");
-            return ge::GRAPH_FAILED;
-        }
+        OP_CHECK_IF(ctx_.safeGate && !ctx_.hasALog,
+                    OP_LOGE(ctx_.nodeName, "safe_gate requires A_log to be passed."),
+                    return ge::GRAPH_FAILED);
         if (ctx_.hasALog) {
             if (!CheckDim(ctx_.aLogShape, RKDA_METADATA_RANK1, "A_log")) {
                 return ge::GRAPH_FAILED;
@@ -407,6 +438,9 @@ private:
                         return ge::GRAPH_FAILED);
         }
         if (ctx_.hasDtBias) {
+            OP_CHECK_IF(!ctx_.hasALog,
+                        OP_LOGE(ctx_.nodeName, "dt_bias requires A_log to be passed."),
+                        return ge::GRAPH_FAILED);
             size_t rank = ctx_.dtBiasShape.GetDimNum();
             bool valid = (rank == 1 && ctx_.dtBiasShape.GetDim(RKDA_DIM_0) == hvNum * kDim) ||
                          (rank == 2 && ctx_.dtBiasShape.GetDim(RKDA_DIM_0) == hvNum &&
@@ -596,9 +630,8 @@ private:
 
     ge::graphStatus CheckShapeValueRangeAndRule(const RecurrentKdaTilingData &tiling) const
     {
-        OP_CHECK_IF(tiling.nk > 256 || tiling.nv > 256,
-                    OP_LOGE(ctx_.nodeName,
-                            "H/HV must be <= 256, but H=%u, HV=%u.", tiling.nk, tiling.nv),
+        OP_CHECK_IF(ctx_.isA5 != 0 && tiling.dv != 128,
+                    OP_LOGE(ctx_.nodeName, "A5 RegBase design requires K=V=128."),
                     return ge::GRAPH_FAILED);
         OP_CHECK_IF(tiling.dk != 128 || (tiling.dv != 128 && tiling.dv != 256),
                     OP_LOGE(ctx_.nodeName,
@@ -637,8 +670,23 @@ private:
 
     ge::graphStatus RuleFillTilingShapeData(RecurrentKdaTilingData &tiling) const
     {
+        const int64_t maxUint32 = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+        const int64_t nk = ctx_.layout == RKDA_LAYOUT_TND ?
+                               ctx_.queryShape.GetDim(RKDA_DIM_1) :
+                               ctx_.queryShape.GetDim(RKDA_DIM_2);
+        const int64_t nv = ctx_.layout == RKDA_LAYOUT_TND ?
+                               ctx_.valueShape.GetDim(RKDA_DIM_1) :
+                               ctx_.valueShape.GetDim(RKDA_DIM_2);
+        OP_CHECK_IF(nk > maxUint32 || nv > maxUint32,
+                    OP_LOGE(ctx_.nodeName,
+                            "head counts exceed uint32 tiling fields: H=%ld, HV=%ld.", nk, nv),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(ctx_.isA5 != 0 &&
+                        static_cast<uint64_t>(nv - 1) > std::numeric_limits<uint32_t>::max() / (128ULL * 4),
+                    OP_LOGE(ctx_.nodeName, "Gate token gap exceeds the uint32 DMA stride field."),
+                    return ge::GRAPH_FAILED);
         if (ctx_.isA5 != 0) {
-            const int64_t maxCapacity = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+            const int64_t maxCapacity = maxUint32;
             const int64_t seqLen = ctx_.queryShape.GetDim(
                 ctx_.layout == RKDA_LAYOUT_TND ? RKDA_DIM_0 : RKDA_DIM_1);
             const int64_t batch = ctx_.layout == RKDA_LAYOUT_TND ? 1 :
@@ -667,24 +715,56 @@ private:
         return ge::GRAPH_SUCCESS;
     }
 
+    ge::graphStatus PlanA5Ub(RecurrentKdaTilingData &tiling) const
+    {
+        // 3 full FP32 banks + raw input/output double slots + parameter slots + guard.
+        const uint64_t capacity = std::min<uint64_t>(ctx_.ubSize, 248ULL * 1024);
+        uint64_t selected = 0, bytes = 0;
+        // Beta rows are padded to one 32-byte slot per token and double-buffered.
+        // X=8 is the largest A5 tile that fits with the three state banks.
+        for (uint64_t x : {1ULL, 2ULL, 4ULL, 8ULL}) {
+            const uint64_t betaSlot = std::max<uint64_t>(128, 32 * x);
+            const uint64_t beta = 2 * betaSlot;
+            const uint64_t peak = 199744 + 3072 * x + beta;
+            if (x > tiling.seqLen || 32 * x > betaSlot || peak > capacity) continue;
+            selected = x;
+            bytes = peak;
+        }
+        OP_CHECK_IF(selected == 0 || bytes > std::numeric_limits<uint32_t>::max(),
+                    OP_LOGE(ctx_.nodeName, "A5 UB cannot hold the specified recurrent KDA banks and raw slots."),
+                    return ge::GRAPH_FAILED);
+        tiling.windowSize = static_cast<uint32_t>(selected);
+        tiling.ubCalSize = static_cast<uint32_t>(capacity);
+        tiling.ubRestBytes = static_cast<uint32_t>(bytes);
+        tiling.vStep = 128;
+        tiling.stateOutBufferNum = 3;
+        tiling.attnOutBufferNum = 2;
+        return ge::GRAPH_SUCCESS;
+    }
+
     int64_t CalcFixedUbBytes(int64_t aNv, int64_t aDv, int64_t aDk) const
     {
+        const int64_t maxMtp = ctx_.isA5 != 0 ? static_cast<int64_t>(RKDA_A5_MAX_MTP) :
+                                               static_cast<int64_t>(RKDA_MAX_MTP);
+        const int64_t windowBufferNum = ctx_.isA5 != 0 ? 2 : 1;
         int64_t usedUbBytes = 0;
-        usedUbBytes += RKDA_MAX_MTP * (4 * aDk + 2 * aDv);   // q/k/v input queues, bf16.
-        usedUbBytes += RKDA_MAX_MTP * 4 * aDk;               // gate input queue, fp32.
+        usedUbBytes += windowBufferNum * maxMtp * (4 * aDk + 2 * aDv); // q/k/v input queues.
+        usedUbBytes += windowBufferNum * maxMtp * 4 * aDk;             // gate input queue.
         const int64_t betaWidth = ctx_.isA5 != 0 ? 16 : aNv;
-        usedUbBytes += RKDA_MAX_MTP * 4 * betaWidth;         // A5 loads one head, padded to 16.
+        usedUbBytes += windowBufferNum * maxMtp * 4 * betaWidth;       // beta rows, padded to 16.
         usedUbBytes += 64 + RKDA_UB_GUARD_BYTES;             // scalar buffer and guard.
         return usedUbBytes;
     }
 
     int64_t CalcWorkingUbBytes(int64_t aNv, int64_t aDv, int64_t aDk) const
     {
+        const int64_t maxMtp = ctx_.isA5 != 0 ? static_cast<int64_t>(RKDA_A5_MAX_MTP) :
+                                               static_cast<int64_t>(RKDA_MAX_MTP);
         int64_t usedUbBytes = CalcFixedUbBytes(aNv, aDv, aDk);
         const int64_t betaWidth = ctx_.isA5 != 0 ? 16 : aNv;
-        usedUbBytes += RKDA_MAX_MTP * (4 * aDv + 12 * aDk + 4 * betaWidth);
+        usedUbBytes += maxMtp * (4 * aDv + 12 * aDk + 4 * betaWidth);
         if (ctx_.isA5 != 0) {
-            usedUbBytes += RKDA_MAX_MTP * 4 * aDk; // Preprocessing cannot alias live state.
+            usedUbBytes += maxMtp * 4 * aDk; // Preprocessing cannot alias live state.
         }
         return usedUbBytes;
     }
@@ -700,13 +780,15 @@ private:
 
     int64_t CalcVStepCoeff(int64_t aDk, uint32_t stateOutBufferNum, uint32_t attnOutBufferNum) const
     {
+        const int64_t maxMtp = ctx_.isA5 != 0 ? static_cast<int64_t>(RKDA_A5_MAX_MTP) :
+                                               static_cast<int64_t>(RKDA_MAX_MTP);
         int64_t stateDtypeSize = (ctx_.stateDtype == ge::DT_FLOAT) ? 4 : 2;
-        int64_t coeff = RKDA_INPUT_BUFFER_NUM * stateDtypeSize * aDk; // state input queue.
-        if (ctx_.stateVFirst == 0) {
-            coeff += stateDtypeSize * aDk; // K-first state transpose buffer.
+        int64_t coeff = (ctx_.isA5 != 0 ? 1 : RKDA_INPUT_BUFFER_NUM) * stateDtypeSize * aDk; // state input queue.
+        if (ctx_.stateVFirst == 0 && !(ctx_.isA5 != 0 && ctx_.stateDtype == ge::DT_FLOAT)) {
+            coeff += stateDtypeSize * aDk; // BF16 or non-A5 K-first transpose buffer.
         }
         coeff += static_cast<int64_t>(stateOutBufferNum) * stateDtypeSize * aDk;
-        coeff += static_cast<int64_t>(attnOutBufferNum) * 2;
+        coeff += static_cast<int64_t>(attnOutBufferNum) * 2 * (ctx_.isA5 != 0 ? maxMtp : 1);
         coeff += CalcComputeUbCoeff(aDk);
         return coeff;
     }
@@ -715,16 +797,18 @@ private:
                                uint32_t attnOutBufferNum, const RecurrentKdaTilingData &tiling,
                                BufferProfile &profile) const
     {
+        const int64_t maxMtp = ctx_.isA5 != 0 ? static_cast<int64_t>(RKDA_A5_MAX_MTP) :
+                                               static_cast<int64_t>(RKDA_MAX_MTP);
         const int64_t vStepAlignment = ctx_.stateVFirst == 0 ? 16 : 8;
         int64_t coeff = CalcVStepCoeff(aDk, stateOutBufferNum, attnOutBufferNum);
         int64_t vStep = (ubSize - usedUbBytes) / coeff / vStepAlignment * vStepAlignment;
-        if (vStep < static_cast<int64_t>(RKDA_MAX_MTP)) {
+        if (vStep < maxMtp) {
             return false;
         }
         int64_t repeatTime = Ops::Base::CeilDiv(tiling.dv, static_cast<uint32_t>(vStep));
         vStep = Ops::Base::CeilAlign(Ops::Base::CeilDiv(tiling.dv, static_cast<uint32_t>(repeatTime)),
                                      static_cast<uint32_t>(vStepAlignment));
-        if (vStep < static_cast<int64_t>(RKDA_MAX_MTP)) {
+        if (vStep < maxMtp) {
             return false;
         }
         profile.stateOutBufferNum = stateOutBufferNum;
@@ -774,7 +858,8 @@ private:
         }
 
         if (!selected.valid) {
-            OP_LOGE(ctx_.nodeName, "vStep should be at least %zu, shape is too big", RKDA_MAX_MTP);
+            OP_LOGE(ctx_.nodeName, "vStep should be at least %zu, shape is too big",
+                    ctx_.isA5 != 0 ? RKDA_A5_MAX_MTP : RKDA_MAX_MTP);
             return ge::GRAPH_FAILED;
         }
 
@@ -785,6 +870,19 @@ private:
         if (ubRestBytes < 0) {
             OP_LOGE(ctx_.nodeName, "ubRestBytes should be non-negative, but got %ld", ubRestBytes);
             return ge::GRAPH_FAILED;
+        }
+        if (ctx_.isA5 != 0) {
+            // Match arch35 InitLocalBuffers: fixed FP32 window tensors plus
+            // the live state and row outputs. The unused UB tail is not scratch.
+            const int64_t computeBytes = ubCalcCtx.workingUbBytes - ubCalcCtx.fixedUbBytes +
+                                         CalcComputeUbCoeff(aDk) * static_cast<int64_t>(selected.vStep);
+            const int64_t alignedComputeBytes = Ops::Base::CeilAlign(computeBytes, static_cast<int64_t>(32));
+            if (alignedComputeBytes > ubRestBytes) {
+                OP_LOGE(ctx_.nodeName, "compute UB bytes %ld exceed available bytes %ld",
+                        alignedComputeBytes, ubRestBytes);
+                return ge::GRAPH_FAILED;
+            }
+            ubRestBytes = alignedComputeBytes;
         }
         tiling.ubCalSize = static_cast<uint32_t>(ctx_.ubSize);
         tiling.vStep = selected.vStep;

@@ -95,7 +95,9 @@ public:
         hasALog_ = (tilingData->hasALog == 1);
         hasDtBias_ = (tilingData->hasDtBias == 1);
         useQkL2norm_ = (tilingData->useQkL2norm == 1);
-        useGateInKernel_ = (tilingData->useGateInKernel == 1);
+        // Gate semantics are selected by A_log presence.  The legacy
+        // use_gate_in_kernel attribute is kept only for ABI compatibility.
+        useGateInKernel_ = hasALog_;
         useBetaSigmoid_ = (tilingData->useBetaSigmoid == 1);
         allowNegEigval_ = (tilingData->allowNegEigval == 1);
         safeGate_ = (tilingData->safeGate == 1);

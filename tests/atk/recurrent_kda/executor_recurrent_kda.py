@@ -42,12 +42,15 @@ def build_inputs(spec: dict[str, Any], device: torch.device, high_precision: boo
     B, T, H, HV, K, V = (int(spec[x]) for x in ("B", "T", "H", "HV", "K", "V"))
     lengths = spec.get("lengths", [T] * B)
     capacity = sum(lengths) + int(spec.get("padding", 0))
-    layout = spec.get("layout", "BSND")
-    prefix = ((capacity,) if layout == "TND" else
-              (1, capacity) if "lengths" in spec else (B, T))
+    # The operator infers the storage mode from cu_seqlens presence.  Keep
+    # layout in the case files only as a compatibility argument.
+    varlen = bool(spec.get("cu", True))
+    prefix = (capacity,) if varlen else (B, T)
     g_dtype, beta_dtype = spec.get("g_dtype", "fp32"), spec.get("beta_dtype", "fp32")
-    gd = aux if high_precision or g_dtype == "fp32" else torch.bfloat16
-    bd = aux if high_precision or beta_dtype == "fp32" else torch.bfloat16
+    gd = aux if high_precision or g_dtype == "fp32" else (
+        torch.float16 if g_dtype == "fp16" else torch.bfloat16)
+    bd = aux if high_precision or beta_dtype == "fp32" else (
+        torch.float16 if beta_dtype == "fp16" else torch.bfloat16)
     q = _randn((*prefix, H, K), "bf16", calc, device, seed + 1)
     k = _randn((*prefix, H, K), "bf16", calc, device, seed + 2)
     v = _randn((*prefix, HV, V), "bf16", calc, device, seed + 3)
@@ -57,7 +60,8 @@ def build_inputs(spec: dict[str, Any], device: torch.device, high_precision: boo
             q[..., 0] = 2.0 ** -12; k[..., 0] = 2.0 ** -12
         elif spec["pattern"] == "signal":
             q[..., 0] = 1.0; k[..., 0] = 1.0; v.fill_(1.0)
-    if spec.get("use_gate_in_kernel", False):
+    has_a_log = bool(spec.get("a_log", spec.get("use_gate_in_kernel", False)))
+    if has_a_log:
         g = _randn((*prefix, HV, K), g_dtype, gd, device, seed + 4, scale=0.3)
         if spec.get("large_gate", False):
             g[..., ::2] = 100.0; g[..., 1::2] = -100.0
@@ -84,6 +88,11 @@ def build_inputs(spec: dict[str, Any], device: torch.device, high_precision: boo
         state_capacity = len(lengths) * 3 + 2
         if spec["indices"] == "packed":
             indices = torch.cat([indices[i, :length] for i, length in enumerate(lengths)])
+            # Packed metadata covers the physical token capacity, including
+            # the unused tail.  Only cu_seqlens' valid prefix is consumed.
+            if capacity > indices.numel():
+                indices = torch.cat([indices, torch.full(
+                    (capacity - indices.numel(),), -1, dtype=metadata_dtype, device=device)])
         accepted = _int_tensor([min(int(spec.get("accepted", 1)), n) if n else 0 for n in lengths],
                                device, metadata_dtype)
     tail = (V, K) if spec.get("state_v_first", True) else (K, V)
@@ -113,12 +122,13 @@ def build_inputs(spec: dict[str, Any], device: torch.device, high_precision: boo
     inputs = dict(**tensors, g=g, beta=beta, initial_state=None if spec.get("initial_none") else state,
                   cu_seqlens=_int_tensor(offsets, device, metadata_dtype) if spec.get("cu", True) else None,
                   ssm_state_indices=indices, num_accepted_tokens=accepted)
-    if spec.get("use_gate_in_kernel", False):
+    if has_a_log:
         # Apply the shift before promotion so DUT and FP64 golden see exactly
         # the same FP32 input bits (rather than two different rounding paths).
         a_log = _randn((HV,), "fp32", torch.float32, torch.device("cpu"), seed + 7, scale=0.1) - 2.0
         inputs["A_log"] = a_log.to(aux).to(device)
-        inputs["dt_bias"] = _randn((HV, K), "fp32", aux, device, seed + 8, scale=0.05)
+        inputs["dt_bias"] = (None if spec.get("dt_bias_none", False) else
+                             _randn((HV, K), "fp32", aux, device, seed + 8, scale=0.05))
     return inputs
 
 
@@ -135,17 +145,17 @@ def call_options(spec):
 
 # CPU reference copied from the operator PTA reference so this executor is self-contained.
 def _flatten_bsnd(x: torch.Tensor, layout: str) -> torch.Tensor:
-    if layout == "TND":
+    del layout
+    if x.ndim == 3:
         return x
-    if layout != "BSND":
-        raise ValueError("layout must be BSND or TND")
-    return x.reshape(x.shape[0] * x.shape[1], *x.shape[2:])
+    if x.ndim == 4:
+        return x.reshape(x.shape[0] * x.shape[1], *x.shape[2:])
+    raise ValueError("q/k/v/g must be rank 3 with cu_seqlens or rank 4 without it")
 
 
 def _restore_layout(x: torch.Tensor, ref: torch.Tensor, layout: str) -> torch.Tensor:
-    if layout == "TND":
-        return x
-    return x.reshape(ref.shape)
+    del layout
+    return x if ref.ndim == 3 else x.reshape(ref.shape)
 
 
 def _seq_ranges(total_tokens: int, cu_seqlens: Sequence[int]):
@@ -193,6 +203,7 @@ def recurrent_kda_reference(
     safe_gate: bool = False,
     lower_bound: float = -5.0,
     state_v_first: bool = True,
+    state_storage_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     del output_final_state, inplace_final_state
 
@@ -201,7 +212,7 @@ def recurrent_kda_reference(
     k_flat = _flatten_bsnd(k, layout).to(work_dtype)
     v_flat = _flatten_bsnd(v, layout).to(work_dtype)
     g_flat = _flatten_bsnd(g, layout).to(work_dtype)
-    beta_flat = _flatten_bsnd(beta, layout).to(work_dtype)
+    beta_flat = beta.reshape(-1, beta.shape[-1]).to(work_dtype)
     total_tokens, h, dk = q_flat.shape
     _, hv, dv = v_flat.shape
     scale = (dk ** -0.5) if scale is None else scale
@@ -211,9 +222,7 @@ def recurrent_kda_reference(
         k_flat = k_flat / torch.sqrt((k_flat * k_flat).sum(dim=-1, keepdim=True) + 1e-6)
     q_flat = q_flat * scale
 
-    if use_gate_in_kernel:
-        if A_log is None:
-            raise ValueError("A_log is required when use_gate_in_kernel=True")
+    if A_log is not None:
         gate = g_flat
         if dt_bias is not None:
             gate = gate + dt_bias.to(work_dtype).reshape(hv, dk).unsqueeze(0)
@@ -233,11 +242,8 @@ def recurrent_kda_reference(
             beta_eff = beta_eff * 2.0
 
     if cu_seqlens is None:
-        if layout.upper() == "BSND":
-            dense_seq_len = q.shape[1]
-            cu_seqlens = [i * dense_seq_len for i in range(q.shape[0] + 1)]
-        else:
-            cu_seqlens = [0, total_tokens]
+        dense_seq_len = q.shape[1]
+        cu_seqlens = [i * dense_seq_len for i in range(q.shape[0] + 1)]
     ranges = _seq_ranges(total_tokens, cu_seqlens)
     state_dtype = initial_state.dtype if initial_state is not None else work_dtype
     if initial_state is None:
@@ -266,6 +272,10 @@ def recurrent_kda_reference(
                 delta = delta * beta_eff[token, hv_idx]
                 state_cur = state_cur + torch.outer(delta, k_flat[token, h_idx])
                 out_flat[token, hv_idx] = torch.mv(state_cur, q_flat[token, h_idx])
+                # A5 stores each recurrent update in the interface State dtype.
+                # Keep out based on the unrounded FP32/FP64 register result.
+                if state_storage_dtype == torch.bfloat16:
+                    state_cur = state_cur.to(torch.bfloat16).to(work_dtype)
                 out_slot = _state_slot(ssm_state_indices, seq_idx, start, token) if ssm_state_indices is not None else seq_idx
                 state[out_slot, hv_idx] = state_cur
 
@@ -279,13 +289,16 @@ def _visible_outputs(outputs, spec):
         return outputs
     valid = sum(spec["lengths"])
     out, state = outputs
-    return (out[:valid] if spec["layout"] == "TND" else out[:, :valid]), state
+    return (out[:valid] if spec.get("cu", True) else out[:, :valid]), state
 
 
 def run_cpu(spec: dict[str, Any], high_precision: bool = False):
     torch.set_num_threads(1)
     inputs = build_inputs(spec, torch.device("cpu"), high_precision)
-    return _visible_outputs(recurrent_kda_reference(**inputs, **call_options(spec)), spec)
+    storage_dtype = (torch.bfloat16 if spec.get("soc", "ascend950") == "ascend950"
+                     and spec.get("state_dtype", "fp32") == "bf16" and not spec.get("initial_none") else None)
+    return _visible_outputs(recurrent_kda_reference(**inputs, **call_options(spec),
+                                                   state_storage_dtype=storage_dtype), spec)
 
 
 def run_npu(spec: dict[str, Any], input_data: InputDataset, inputs=None):

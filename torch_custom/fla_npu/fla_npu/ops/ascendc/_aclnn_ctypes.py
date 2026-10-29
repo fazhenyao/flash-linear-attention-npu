@@ -4443,10 +4443,10 @@ def npu_recurrent_kda(
 ):
     import torch
 
+    # The public layout argument is retained for ABI compatibility.  Rank and
+    # sequence mode are determined exclusively by cu_seqlens presence.
     layout = str(layout)
-    if layout not in ("BSND", "TND"):
-        raise RuntimeError("npu_recurrent_kda: layout must be BSND or TND.")
-    is_tnd = layout == "TND"
+    is_tnd = cu_seqlens is not None
     q_shape, k_shape, v_shape = _shape(q), _shape(k), _shape(v)
     g_shape, beta_shape = _shape(g), _shape(beta)
     expected_q_rank = 3 if is_tnd else 4
@@ -4458,8 +4458,8 @@ def npu_recurrent_kda(
         or len(beta_shape) != (2 if is_tnd else 3)
     ):
         raise RuntimeError(
-            "npu_recurrent_kda: layout/rank mismatch. TND expects q/k [T,H,K], v [T,HV,V], "
-            "g [T,HV,K], beta [T,HV]; BSND expects q/k [B,T,H,K], v [B,T,HV,V], "
+            "npu_recurrent_kda: rank mismatch. With cu_seqlens q/k are [T,H,K], "
+            "v [T,HV,V], g [T,HV,K], beta [T,HV]; without it q/k are [B,T,H,K], "
             "g [B,T,HV,K], beta [B,T,HV]."
         )
     if q_shape != k_shape:
@@ -4501,7 +4501,7 @@ def npu_recurrent_kda(
         raise RuntimeError("npu_recurrent_kda: K/V currently support only K=128,V=128 or K=128,V=256.")
 
     if cu_seqlens is None:
-        seq_num = batch if not is_tnd else 1
+        seq_num = batch
     else:
         if (
             not isinstance(cu_seqlens, torch.Tensor)
@@ -4561,7 +4561,8 @@ def npu_recurrent_kda(
         if num_accepted_tokens.device != q.device:
             raise RuntimeError("npu_recurrent_kda: num_accepted_tokens must be on the same device as q.")
 
-    use_gate = _optional_bool(use_gate_in_kernel, False)
+    # A_log presence selects raw-gate mode; the legacy boolean is ignored.
+    use_gate = A_log is not None
     safe = _optional_bool(safe_gate, False)
     lower = _optional_float(lower_bound, -5.0)
     if use_gate:
@@ -4577,8 +4578,8 @@ def npu_recurrent_kda(
                 raise RuntimeError("npu_recurrent_kda: dt_bias must be FP32 [HV*K] or [HV,K].")
             if dt_bias.device != q.device:
                 raise RuntimeError("npu_recurrent_kda: dt_bias must be on the same device as q.")
-    elif safe or A_log is not None or dt_bias is not None:
-        raise RuntimeError("npu_recurrent_kda: A_log, dt_bias and safe_gate require use_gate_in_kernel=True.")
+    elif safe or dt_bias is not None:
+        raise RuntimeError("npu_recurrent_kda: dt_bias and safe_gate require A_log to be passed.")
 
     out = _empty_like(v)
     final_state_work = initial_state_work if inplace else _empty(state_shape, initial_state_work)
