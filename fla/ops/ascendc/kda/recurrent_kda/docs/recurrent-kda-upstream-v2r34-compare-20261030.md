@@ -205,7 +205,7 @@
 
 ## 复核
 
-本机证据：`output/rkda-upstream-v2r34-compare-20261030/`；同名远端任务目录位于`/home/fazhenyao123/runs/`。保存原始CSV、每例5样本、输入/属性清单、占用、运行命令、版本差异和二进制哈希。
+本机证据：`output/rkda-upstream-v2r34-compare-20261030/`；同名远端任务目录位于`<run-root>/`。保存原始CSV、每例5样本、输入/属性清单、占用、运行命令、版本差异和二进制哈希。
 
 ```bash
 bash run.sh upstream

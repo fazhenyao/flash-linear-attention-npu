@@ -26,7 +26,7 @@ Shape 符号统一引用 [KDA 模型符号表](../../README.md#model-shape-symbo
 | `g` | 必选 | `BSND=[B,T,H_v,K]` 或 `TND=[T,H_v,K]` | FP32/BF16/FP16 | BSND/TND | 预计算 step log gate 或 raw gate |
 | `beta` | 必选 | `BSND=[B,T,H_v]` 或 `TND=[T,H_v]` | FP32/BF16/FP16 | BSND/TND | delta 更新系数 |
 | `initial_state` | Python 可选，aclnn 必选 | V-first `[state_capacity,H_v,V,K]` 或 K-first `[state_capacity,H_v,K,V]` | FP32/BF16 | ND | 可变 state pool；Python 仅在非原位模式下允许为空，并创建 `[seq_num,...]` 全零 FP32 状态 |
-| `cu_seqlens` | 可选 | `[seq_num+1]` | INT32/INT64 | ND | 提供时使用 fla-org 累积 offset；为空时必须为 rank4 BSND，按 batch 行划分；提供时必须为 rank3 packed TND |
+| `cu_seqlens` | 可选 | `[seq_num+1]` | INT32/INT64 | ND | 提供时使用 fla-org 累积 offset；标准表示为空时为 rank4 BSND，按 batch 行划分；提供时为 rank3 packed TND；旧 rank 组合的迁移见第 4.1 节 |
 | `ssm_state_indices` | 可选 | packed `[>=T]` 或 speculative `[seq_num,max_step]` | INT32/INT64 | ND | 每个 token 对应的 state pool 槽索引 |
 | `A_log` | 可选 | `[H_v]` | FP32 | ND | 传入时 g 为 raw gate，否则为 step log gate |
 | `dt_bias` | 可选 | `[H_v*K]` 或 `[H_v,K]` | FP32 | ND | raw gate 偏置；无 A_log 时忽略，不检查其专用 shape/dtype |
@@ -96,7 +96,7 @@ aclnnStatus aclnnRecurrentKda(void *workspace, uint64_t workspaceSize, aclOpExec
 shape、storage、stride 和 offset，kernel 按 tiling
 中的真实 stride 直接访问。原位模式直接写回输入 view；非原位模式直接写入 `finalState` view。原位模式若调用者
 另外传入独立的 `finalState` 输出，仅为该输出保留一次必要的 `ViewCopy`。`cuSeqlensOptional` 为空时，BSND
-必须使用 rank4 BSND；提供时必须使用 rank3 TND。A5 host 通过 cu_seqlens 值依赖计算最大有效序列长度，选择不超过8的 X；元数据复制或同步开销计入调用链。
+标准表示使用 rank4 BSND；提供时标准表示使用 rank3 TND；旧 shape 别名见第 4.1 节。A5 host 通过 cu_seqlens 值依赖计算最大有效序列长度，选择不超过8的 X；元数据复制或同步开销计入调用链。
 A5 的设备 cu_seqlens 在 `GetWorkspaceSize` 中经 `aclrtSynchronizeDevice` 和 D2H 复制取得，随后由 executor 持有 host 常量并向 kernel 提供该次值。固定长度路径不增加这次同步。
 当前 packed 路径不能在 ACLGraph 捕获中调用；改变 cu_seqlens 后须重新创建 executor，不能依赖旧 executor/ACLGraph 自动更新边界或 X。device 仍核验元数据。首项必须为 0，offset 必须单调不减，末项不得超过输入 token capacity，
 A5 使用固定容量窗口递推，不限制每段长度为8；A2/A3仍按各自实现的支持范围执行。
@@ -141,6 +141,20 @@ recurrent_kda(q, k, v, g, beta, initial_state=None, *,
 显式传入 state。显式传入的非连续 state view 由 kernel 按真实 stride 直接访问；满足第 7 节约束的 Q/K/V view
 同样保留 storage offset 并直接读取，不满足时自动连续化。原位模式返回与输入相同 storage/stride
 的 state，非原位模式保持输入不变并返回独立 state。
+
+`output_final_state=True` 的非原位输出保留全部未更新槽的初值，包括空请求和稀疏索引未命中的 pool 槽。
+ctypes 和直接 ACLNN 同样遵循此约定；ACLNN 在更新前复制初态的逻辑 view，可能额外产生复制任务。
+该复制仅出现在非原位且要求输出 State 的调用中。
+
+为兼容已发布的 `v26.9.1` 调用，Python 两后端及 ACLNN 保留两种已弃用的 shape 别名：
+
+- rank3 且不传 `cu_seqlens`：在入口补一个大小为 1 的 batch 维，按单请求定长处理。
+- rank4 且传 `cu_seqlens`：在入口将前两维展平为 packed token 维，offset 作用于展平后的输入。
+
+这两种别名保留至 `v26.12`，最早在 `v27.1` 移除。Python 发出 `DeprecationWarning`，ACLNN 记录弃用警告。
+请迁移到 rank4 无 `cu_seqlens` 或 rank3 有 `cu_seqlens` 的标准表示。`layout` 的值始终忽略；
+归一化后的内核仍只根据 `cu_seqlens` 是否传入选择模式，输出保持调用方 `v` 的原 shape。
+旧 rank4 packed 的输入 view 必要时连续化；直接 ACLNN 的该别名要求 `attnOut` 连续。
 
 ### 4.2 调用示例
 
@@ -196,7 +210,7 @@ recurrent_kda<<<blockDim, nullptr, stream>>>(
 - 未传 `ssm_state_indices` 时 `state_capacity=seq_num`；传入后容量可大于序列数，所有有效 slot 必须位于 `[0,state_capacity)`。
 - `ssm_state_indices` 支持 packed `[T]` 和 speculative `[seq_num,max_step]`；活跃序列不得共享正在写入的 state slot。
 - 空序列不读取 `ssm_state_indices/num_accepted_tokens`，也不读写 state pool。
-- `cu_seqlens` 可选；为空时必须为 rank4 BSND，按 batch 行划分；提供时必须为 rank3 packed TND。提供时首项必须为 0，offset
+- `cu_seqlens` 可选；标准表示为空时为 rank4 BSND，按 batch 行划分；提供时为 rank3 packed TND；旧 shape 别名见第 4.1 节。提供时首项必须为 0，offset
   必须单调不减，末项为有效 token 数且不得超过输入
   token capacity；相邻差值为序列长度。A5 host 读取实际值选择 X，device kernel 仍检查边界。
 - 末项小于 capacity 时，kernel 仅处理有效前缀并逐行跳过零长度序列；padding tail 输出不作保证。

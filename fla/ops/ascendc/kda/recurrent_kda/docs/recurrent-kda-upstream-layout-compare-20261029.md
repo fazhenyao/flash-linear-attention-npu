@@ -232,6 +232,6 @@ msprof --output="$root/$label-msprof" --task-time=on \
 ## 证据
 
 - 本机：`D:/PROJECT/flash-linear-attention-npu/output/rkda-upstream-layout-compare-20261029/`。
-- A5_1：`/home/fazhenyao/runs/rkda-upstream-layout-compare-20261029/`，包含完整 PROF 目录。
+- A5_1：`<run-root>/rkda-upstream-layout-compare-20261029/`，包含完整 PROF 目录。
 - 两版 CSV、manifest、opapi/stable/kernel 哈希、设备前后状态、日志、源文件版本核验和分析脚本均归档；`performance-summary.json` 包含逐例样本、CV、最终组及原始首轮组。
 - 只依据本轮同卡测量下结论；不混用 A5_ci、插桩或 simulator 时间。原方案 SHA256 保持 `78f03d56724f4ff6ba36609f1f53dbc05148825b94ee7d253a7867c8c331d5b4`。

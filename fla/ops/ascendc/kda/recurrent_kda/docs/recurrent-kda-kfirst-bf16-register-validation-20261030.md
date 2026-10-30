@@ -47,7 +47,7 @@ K-first BF16耗时比几何均值为**0.497276（-50.27%）**，36/36组正式�
 - K-first BF16最终State和逐token快照两组原生mssanitizer均`No error detected.`，out/State探针对比通过。每组4连续任务、T9、X8，覆盖跨tile、bank复用和下一任务State预取；对应追踪版分别完成49/157条事件，均`HOST_FINALIZED`。入口为使用当前生产Pipeline头文件编译的`state_pipeline_probe`（-O3、sanitizer开启），不是正式RecurrentKda包的mssanitizer报告。
 - K-first FP32小规模正常启动的out、State与kfp29逐位一致；三个控制性能见上表。
 - 当前18个实现/调用源文件审计一致，跨A5_1/A5_ci的两版本共156项so/o SHA256一致；下载证据逐文件核对大小和SHA256。
-- 静态issue覆盖188项通过；仍有114项既有host DFX-MESSAGE发现，两个修改的kernel头文件无发现。A2/A3未上板。受保护原方案SHA256未变。
+- 静态issue覆盖188项通过；仍有当轮114项host DFX-MESSAGE发现，两个修改的kernel头文件无发现。A2/A3未上板。受保护原方案SHA256未变。
 
 ## 完整小规模流水与指令
 
@@ -73,7 +73,7 @@ State UB有效读量32→64KiB/token、写量仍32KiB/token，UB容量和GM Stat
 
 ## 可复核证据和命令
 
-本机`output/rkda-kfirst-bf16-register-20261030/{a5-1,a5-ci}`保存正式样本、占用、CSV、完整小规模trace、构建/精度/契约/确定性/内存日志和源/对象哈希；两个zip自带逐文件SHA256索引。基线29和最终kbf30头文件快照在本地output根目录。服务器沿用`rkda-layout-register-optimizations-20261030`，分别位于A5_1的`/home/fazhenyao/runs/`和A5_ci的`/home/fazhenyao123/runs/`。
+本机`output/rkda-kfirst-bf16-register-20261030/{a5-1,a5-ci}`保存正式样本、占用、CSV、完整小规模trace、构建/精度/契约/确定性/内存日志和源/对象哈希；两个zip自带逐文件SHA256索引。基线29和最终kbf30头文件快照在本地output根目录。服务器沿用`rkda-layout-register-optimizations-20261030`，分别位于A5_1的`<run-root>/`和A5_ci的`<run-root>/`。
 
 ```bash
 # A5_1

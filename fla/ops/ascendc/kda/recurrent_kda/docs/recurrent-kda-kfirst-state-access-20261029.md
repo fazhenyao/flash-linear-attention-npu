@@ -88,7 +88,7 @@ subbank  = (addr >> 3) & 3
 
 环境沿用前次A5_1独立venv及CANN 9.2.0-beta.2。生产对象诊断使用 `msprof op simulator --soc-version=Ascend950PR_957c --kernel-name=RecurrentKda --launch-count=1 --core-id=0 --timeout=1 --aic-metrics=PipeUtilization,ResourceConflictRatio`；独立访存诊断将kernel名替换为 `state_pitch_probe`。每个变体只启动一次，全部完整结束，无重复200样本采集。
 
-- 远程目录：`/home/fazhenyao/runs/rkda-kfirst-state-access-20261029/`。
-- [中文图](/D:/PROJECT/flash-linear-attention-npu/output/rkda-kfirst-state-access-20261029/state-access-diagnosis.png)。
-- [完整证据包](/D:/PROJECT/flash-linear-attention-npu/output/rkda-kfirst-state-access-20261029/state-access-evidence.tar.gz)：诊断源码、两个二进制、全部trace与CSV、命令、输出检查、编译报告和SHA256索引。
-- [统计JSON](/D:/PROJECT/flash-linear-attention-npu/output/rkda-kfirst-state-access-20261029/access-summary.json)：直接解析trace事件计算，不把聚合CSV行数当作执行次数；`prefetch-k`只取首任务的256条Gather和Scatter作对照。
+- 远程目录：`<run-root>/rkda-kfirst-state-access-20261029/`。
+- [中文图](assets/state-access-diagnosis.png)。
+- 完整证据包（仅本地归档，未发布：`state-access-evidence.tar.gz`，SHA256 `11dcc8b656b8fe08a0f1bab506941991145eaf1cc453d0147e601457d07ee711`）：诊断源码、两个二进制、全部trace与CSV、命令、输出检查、编译报告和SHA256索引。
+- 统计JSON（仅本地归档，未发布：`access-summary.json`，SHA256 `dc2a70e9b7ed5b3c3a098313c69b4c8e7ccaea549089478694395ead5e564723`）：直接解析trace事件计算，不把聚合CSV行数当作执行次数；`prefetch-k`只取首任务的256条Gather和Scatter作对照。

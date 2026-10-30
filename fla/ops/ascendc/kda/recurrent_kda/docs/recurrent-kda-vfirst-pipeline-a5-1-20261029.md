@@ -35,7 +35,7 @@ msprof op simulator --soc-version=Ascend950PR_957c \
 
 两版原模型均在3分钟限时后停止并解析成功，未达到 `TARGET_COMPLETE/HOST_FINALIZED`；工具退出0不能解释为完整执行成功。core0.veccore0 导出的相对时间末端：远程17.614μs、当前18.185μs。它们是截断记录长度，不能比较其大小作为性能结果。图中共同展示前17.614μs，同时保留原始 trace。解析还包含 core0.veccore1；主图只展示 veccore0。
 
-[原模型局部流水 PNG](/D:/PROJECT/flash-linear-attention-npu/output/rkda-vfirst-worst-pipeline-20261029/vfirst-pipeline.png) · [SVG](/D:/PROJECT/flash-linear-attention-npu/output/rkda-vfirst-worst-pipeline-20261029/vfirst-pipeline.svg)
+[原模型局部流水 PNG](assets/vfirst-pipeline.png) · [SVG](assets/vfirst-pipeline.svg)
 
 图中分别展开 Scalar、MTE2、Vector 算术与控制、Vector 读 UB、Cast、写 UB、同步指令和 MTE3。读写包含输入、State、out 与临时数据，未按 UB 地址进一步区分。当前原模型片段没有记录 MTE3 搬出，不代表最终不搬出；该片段尚未完成首个8-token tile。空白也不能直接理解为所有流水都空闲。正式对象缺少源码行映射，本轮仅提供指令级流水。
 
@@ -53,7 +53,7 @@ msprof op simulator --soc-version=Ascend950PR_957c \
   "$python" "$root/diagnostic-launch.py" "$label"
 ```
 
-[完整局部诊断 PNG](/D:/PROJECT/flash-linear-attention-npu/output/rkda-vfirst-worst-pipeline-20261029/vfirst-diagnostic-pipeline.png) · [SVG](/D:/PROJECT/flash-linear-attention-npu/output/rkda-vfirst-worst-pipeline-20261029/vfirst-diagnostic-pipeline.svg)
+[完整局部诊断 PNG](assets/vfirst-diagnostic-pipeline.png) · [SVG](assets/vfirst-diagnostic-pipeline.svg)
 
 完整工作量下，动态指令统计如下。它们包含输入、递推和 out 处理，不能全部计为 State 操作；指令执行存在重叠，不把次数乘以延迟后相加作为总耗时。
 
@@ -84,6 +84,6 @@ msprof op simulator --soc-version=Ascend950PR_957c \
 ## 结果位置
 
 - 本机：`D:/PROJECT/flash-linear-attention-npu/output/rkda-vfirst-worst-pipeline-20261029/`。
-- A5_1：`/home/fazhenyao/runs/rkda-vfirst-worst-pipeline-20261029/`，保留完整 OPPROF 目录、正常设备输出、原始输入 storage、tiling 和日志。
+- A5_1：`<run-root>/rkda-vfirst-worst-pipeline-20261029/`，保留完整 OPPROF 目录、正常设备输出、原始输入 storage、tiling 和日志。
 - 本机证据包 `pipeline-evidence.tar.gz` 包含四轮导出 trace、两个 AIV 的原模型解析结果、指令 CSV、图、脚本、日志、绑定和 SHA256 索引；大体积正常调用输出 NPY 和输入 storage 留在服务器，未加入包。
 - 初始 host 诊断链接及 metadata 过滤曾失败，均发生在正式采集之前；修正后四轮采集使用相同正式 `.o`。未重试此前已知失败的真机 PipeTimeline 路径。

@@ -604,6 +604,9 @@ def npu_recurrent_kda(
 
     # Stable ABI still carries an integer slot for the legacy attribute, but
     # the recurrent kernel ignores its value.
+    from ._recurrent_kda_compat import normalize_inputs
+
+    q, k, v, g, beta, output_shape = normalize_inputs(q, k, v, g, beta, cu_seqlens)
     layout_code = 0
     if A_log is None:
         dt_bias, safe_gate, lower_bound = None, False, -5.0
@@ -645,7 +648,7 @@ def npu_recurrent_kda(
             use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
             allow_neg_eigval=allow_neg_eigval, safe_gate=safe_gate,
             lower_bound=lower_bound, state_v_first=state_v_first)
-        return out, (scratch if output_final_state else None)
+        return (out.reshape(output_shape) if output_shape is not None else out), (scratch if output_final_state else None)
 
     scale_value = (float(q.shape[-1]) ** -0.5) if scale is None else float(scale)
     lower = -5.0 if lower_bound is None else float(lower_bound)
@@ -692,7 +695,7 @@ def npu_recurrent_kda(
         if bump is None:
             bump = _increment_version()
         bump((initial_state,))
-    return out, final_state
+    return (out.reshape(output_shape) if output_shape is not None else out), final_state
 
 
 # ---------------------------------------------------------------------------

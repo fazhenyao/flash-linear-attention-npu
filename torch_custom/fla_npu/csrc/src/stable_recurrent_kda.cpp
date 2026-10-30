@@ -133,7 +133,7 @@ void run_recurrent_kda(AtenTensorHandle q, AtenTensorHandle k,
   if (get_ret != 0) {
     throw std::runtime_error(
         "fla_npu(stable): aclnnRecurrentKdaGetWorkspaceSize failed: " +
-        std::to_string(get_ret));
+        std::to_string(get_ret) + "; " + rt.recent_error_message());
   }
 
   Tensor workspace;
@@ -162,7 +162,7 @@ void run_recurrent_kda(AtenTensorHandle q, AtenTensorHandle k,
   if (launch_ret != 0) {
     throw std::runtime_error(
         "fla_npu(stable): aclnnRecurrentKda failed: " +
-        std::to_string(launch_ret));
+        std::to_string(launch_ret) + "; " + rt.recent_error_message());
   }
   if (!output_final_state) {
     *final_state = Tensor();

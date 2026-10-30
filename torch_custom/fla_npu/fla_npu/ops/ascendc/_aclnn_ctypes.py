@@ -4442,6 +4442,9 @@ def npu_recurrent_kda(
     state_v_first=False,
 ):
     import torch
+    from ._recurrent_kda_compat import normalize_inputs
+
+    q, k, v, g, beta, output_shape = normalize_inputs(q, k, v, g, beta, cu_seqlens)
 
     # The public layout argument is retained for ABI compatibility.  Rank and
     # sequence mode are determined exclusively by cu_seqlens presence.
@@ -4622,7 +4625,7 @@ def npu_recurrent_kda(
         (out, initial_state_work, final_state_arg),
     )
     final_state = final_state_work if output_final else None
-    return out, final_state
+    return (out.reshape(output_shape) if output_shape is not None else out), final_state
 
 # Dense BSND Host code transposes all ten inputs to BNSD. Its four internal
 # outputs alias the transposed gradient inputs, so bounding this input footprint

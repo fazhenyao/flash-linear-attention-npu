@@ -34,7 +34,7 @@ layout22至layout26均完成标准单算子run构建安装、libcust_opapi一致
 
 原生小用例逐位核对通过：打包AND前后out/State一致；K-first BF16交错前后、K-first FP32交错候选前后out/State一致；最终组合V-first与layout22、K-first BF16与layout25也逐位一致。FMA相对原始点积的数值变化按原CPU混合容差验收，不要求与reg20逐位一致。
 
-本轮未改UB地址、数据类型、State bank生命周期、必要同步、预取及整tile完成后批量搬出out，未重复原生内存检测。改动仅在arch35；A2/A3未上板。仓库issue覆盖188项通过；全算子静态扫描仍有114项既有host DFX-MESSAGE问题，两个本轮kernel头文件无静态发现，不能将全算子静态扫描写成通过。
+本轮未改UB地址、数据类型、State bank生命周期、必要同步、预取及整tile完成后批量搬出out，未重复原生内存检测。改动仅在arch35；A2/A3未上板。仓库issue覆盖188项通过；全算子静态扫描仍有当轮114项host DFX-MESSAGE问题，两个本轮kernel头文件无静态发现，不能将全算子静态扫描写成通过。
 
 ## 完整模型性能
 

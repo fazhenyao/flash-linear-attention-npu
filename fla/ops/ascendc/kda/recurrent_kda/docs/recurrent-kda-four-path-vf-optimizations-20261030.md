@@ -83,11 +83,11 @@ ID34 V-first FP32原+12.72%未在配对复测中重现，复测+0.21%；不能�
 - 小规模正式原生对象，四路径out和State共8项与vuf43逐位一致；这只覆盖该小规模输入，不替代186项CPU标杆精度。
 - 当前Pipeline的state_pipeline_probe经mssanitizer内存检查10组通过：FP32/BF16×V/K-first×最终State/逐token快照8组，X8/T9、每核4个连续任务，覆盖跨tile、bank复用与预取；另有两dtype的K-first X1/T1/快照2组，覆盖最小X的scratch边界。全部No error detected、bad_out=0 bad_state=0、HOST_FINALIZED。此证据是探针入口，不冒充标准RecurrentKda入口的mssanitizer报告。
 - 第一轮内存辅助脚本因Windows CRLF导致`pipefail`选项错误，尚未执行内存检查；保留失败日志，转LF后只补跑内存、最终核验和仿真，没有重复已通过的精度及模型性能。
-- 静态issue覆盖188项、21条规则检查通过；仍有114项既有host DFX-MESSAGE发现，修改的kernel无新发现，不能宣称全仓静态零问题。A2/A3未上板；本轮只改arch35实现，不据此宣称两平台实测通过。
+- 静态issue覆盖188项、21条规则检查通过；仍有当轮114项host DFX-MESSAGE发现，修改的kernel无新发现，不能宣称全仓静态零问题。A2/A3未上板；本轮只改arch35实现，不据此宣称两平台实测通过。
 
 ## 命令与证据
 
-远端复用本任务隔离目录`/home/fazhenyao/runs/rkda-dual-issue-20261030`，所有本轮产物使用vb46/vf47/kf48/kb49/vb50/kf52/kb53/ks54前缀。标准构建/安装、逐例占用、选例和源文件审计的完整脚本与执行日志已归档。关键命令入口：
+远端复用本任务隔离目录`<run-root>/rkda-dual-issue-20261030`，所有本轮产物使用vb46/vf47/kf48/kb49/vb50/kf52/kb53/ks54前缀。标准构建/安装、逐例占用、选例和源文件审计的完整脚本与执行日志已归档。关键命令入口：
 
 ```bash
 bash run-round.sh ks54

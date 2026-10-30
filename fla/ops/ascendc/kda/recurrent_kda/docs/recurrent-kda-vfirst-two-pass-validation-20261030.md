@@ -100,7 +100,7 @@ v2r33和v2r34各完成标准run构建安装、libcust_opapi MD5、72对象JSON/b
 
 最终v2r34在X>1的State有效UB读量为FP32 128KiB/token、BF16 64KiB/token，写量仍64/32KiB；X=1保留原64/32KiB单遍读取。GM流量与UB峰值不增加，512B scratch由v改为delta。没有新增FP32 State影子。
 
-静态issue覆盖188项通过；仍有114项既有host DFX-MESSAGE发现，两个修改kernel头文件无发现。A2/A3未上板。受保护原方案SHA256未改；本独立补充与docs/design.md已同步采用的实现。
+静态issue覆盖188项通过；仍有当轮114项host DFX-MESSAGE发现，两个修改kernel头文件无发现。A2/A3未上板。受保护原方案SHA256未改；本独立补充与docs/design.md已同步采用的实现。
 
 ## 可复核路径与命令
 

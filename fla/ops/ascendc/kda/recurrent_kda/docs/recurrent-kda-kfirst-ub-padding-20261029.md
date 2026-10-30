@@ -20,7 +20,7 @@ FP32 K-first 每 bank 由64增至68KiB，三个 bank 共增加12KiB；BF16 的36
 
 ## 结果
 
-构建与测试在 A5_1（179.223.2.2）进行，CANN 9.2.0-beta.2，Python 3.11.17、torch 2.9.0+cpu、torch_npu 2.9.0.post6；真机计时使用健康的 Ascend950PR 物理卡7、逻辑卡0。系统有其他用户常驻进程，采集前后卡7利用率为0%，不宣称独占环境。最初尝试卡6时其他任务占满设备，该次未形成性能对比数据。
+构建与测试在 A5_1（<remote-host>）进行，CANN 9.2.0-beta.2，Python 3.11.17、torch 2.9.0+cpu、torch_npu 2.9.0.post6；真机计时使用健康的 Ascend950PR 物理卡7、逻辑卡0。系统有其他用户常驻进程，采集前后卡7利用率为0%，不宣称独占环境。最初尝试卡6时其他任务占满设备，该次未形成性能对比数据。
 
 标准命令为 `bash build.sh --soc=ascend950 --pkg --vendor_name=fla_npu --ops=recurrent_kda -j12`。系统 OPP vendors 目录对当前用户不可读，构建通过任务独立的 OPP 配置目录完成；built-in 保留系统文件。因 build.sh 会重新加载 CANN 环境，编译子 shell 用 BASH_ENV 恢复该配置。真机测试仍用系统原始 ASCEND_OPP_PATH。未修改 CANN 安装或系统权限。
 
@@ -122,7 +122,7 @@ V-first 完整短请求仿真由7.259增至9.225 μs，说明不能仅凭其 UB 
 实现涉及 `op_kernel/arch35/recurrent_kda_regbase.h`、`recurrent_kda_pipeline.h`、`op_kernel/recurrent_kda.cpp` 和 host 的 `recurrent_kda_tiling_processor.h`。公开接口、tiling data ABI、CPU 标杆及必要同步均未修改；本轮未做 A2/A3 上板测试。
 
 - 本地结果根：`D:/PROJECT/flash-linear-attention-npu/output/rkda-kfirst-ub-padding-20261029`。
-- 远程结果根：`/home/fazhenyao/runs/rkda-kfirst-ub-padding-20261029`，包含源码、标准 run 包、独立 venv、完整 profiling 目录与正式报告。
+- 远程结果根：`<run-root>/rkda-kfirst-ub-padding-20261029`，包含源码、标准 run 包、独立 venv、完整 profiling 目录与正式报告。
 - `performance-summary.json`：逐 case 样本、均值、比例、异常原始组与重测组；`before/after.csv` 及 `before/after-retry31.csv` 为原始 msprof 表。
 - `simulator-summary.json`、六份 `*-trace.json` 和 `*-binding.json`：指令耗时与二进制身份；`state-padding-pipeline.png/svg` 为中文流水图。
 - `build-audit.json`、`source-index.json`：源码/产物哈希；`formal-*.json` 为最终正式报告，`memcheck-*.log/out` 为内存检查。

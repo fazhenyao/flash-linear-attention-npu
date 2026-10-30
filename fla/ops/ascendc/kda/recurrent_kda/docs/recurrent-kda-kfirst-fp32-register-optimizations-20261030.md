@@ -69,7 +69,7 @@ State Gather/Scatter改为连续VLD/VST；新增寄存器内系数Gather不能�
 
 另用当前生产Pipeline头文件编译-O3、启用sanitizer的原生探针，在A5_1卡7对K-first FP32最终State和逐token快照各执行一组mssanitizer memcheck，均No error detected，out/State探针对比通过。每组4个连续任务、序列长9、X8，覆盖跨tile、bank复用与下一任务预取；对应追踪版分别完成49/157条事件记录，均HOST_FINALIZED。探针入口为state_pipeline_probe，不冒充正式RecurrentKda对象的mssanitizer报告。
 
-静态issue覆盖188项通过；全算子仍有114项既有host DFX-MESSAGE发现，两个修改的kernel头文件无发现。A2/A3未上板；此次只修改arch35。原始受保护方案SHA256保持不变；正式design.md通过本补充描述当前K-first FP32特殊流程。
+静态issue覆盖188项通过；全算子仍有当轮114项host DFX-MESSAGE发现，两个修改的kernel头文件无发现。A2/A3未上板；此次只修改arch35。原始受保护方案SHA256保持不变；正式design.md通过本补充描述当前K-first FP32特殊流程。
 
 ## 可复核证据与命令
 

@@ -129,7 +129,15 @@ def main():
                 assert all(compare.compute_accuracy_result(a.cpu(), b.float(), f"output_{i}.pt").result
                            for i, (a, b) in enumerate(zip(actual, golden)))
                 count += 1
-    for invalid in ["head_ratio", "q_dtype", "state_stride", "cu_start", "cu_order", "cu_capacity"]:
+    expected_errors = {
+        "head_ratio": ("161002", "HV must be divisible by H"),
+        "q_dtype": ("161002", "query"),
+        "state_stride": ("161002", "EZ0037", "initialStateRef", "inner state matrix dense"),
+        "cu_start": ("161002", "cu_seqlens", "index=0", "actual=1", "capacity=17"),
+        "cu_order": ("161002", "cu_seqlens", "index=1", "actual=-1", "capacity=17"),
+        "cu_capacity": ("161002", "cu_seqlens", "index=1", "actual=18", "capacity=17"),
+    }
+    for invalid, fragments in expected_errors.items():
         spec = base_spec(T=17, inplace=True, HV=3 if invalid == "head_ratio" else 4)
         inputs = build_inputs(spec, device)
         if invalid == "q_dtype":
@@ -144,10 +152,20 @@ def main():
         try:
             recurrent_kda(**inputs, **call_options(spec))
             torch.npu.synchronize()
-        except (RuntimeError, ValueError):
+        except (RuntimeError, ValueError) as exc:
+            message = str(exc)
+            assert all(fragment in message for fragment in fragments), (invalid, fragments, message)
             count += 1
         else:
             raise AssertionError(f"accepted invalid {invalid}")
+        # A rejected input must not poison the device or be an asynchronous
+        # kernel failure disguised as successful validation.
+        healthy = base_spec(T=1, H=1, HV=1, pattern="signal", state_zero=True)
+        actual = recurrent_kda(**build_inputs(healthy, device), **call_options(healthy))
+        torch.npu.synchronize()
+        golden = run_cpu(healthy, high_precision=True)
+        assert all(compare.compute_accuracy_result(a.cpu(), b.float(), f"output_{i}.pt").result
+                   for i, (a, b) in enumerate(zip(actual, golden)))
     # Reuse the repository's mutation/grad regression for just the affected op.
     path = Path(__file__).resolve().parents[3] / "stable_abi/regression_mutation_contract.py"
     module_spec = importlib.util.spec_from_file_location("mutation_contract", path)

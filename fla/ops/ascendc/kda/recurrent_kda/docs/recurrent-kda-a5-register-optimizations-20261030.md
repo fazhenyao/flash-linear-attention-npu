@@ -45,7 +45,7 @@ reg20第一次物理卡4计时出现数倍异常和最高35% CV；采集前后np
 
 ## 静态检查范围
 
-issue覆盖检查通过（188个COMPLETED issue）。全算子静态扫描仍报告114项既有DFX-MESSAGE问题，均在本轮未修改的host文件；本轮两个kernel头文件没有静态发现。此次不扩大到host错误码整改，不能将全量静态检查写成通过。
+issue覆盖检查通过（188个COMPLETED issue）。全算子静态扫描仍报告当轮114项DFX-MESSAGE问题，均在本轮未修改的host文件；本轮两个kernel头文件没有静态发现。此次不扩大到host错误码整改，不能将全量静态检查写成通过。
 
 ## 最终保留：reg20
 
@@ -82,7 +82,7 @@ bash ci4-perf.sh cifinal4 full
 python final-report.py
 ```
 
-A5_ci证据目录：`/home/fazhenyao123/runs/rkda-register-optimizations-20261030`。A5_1构建、精度及仿真证据：`/home/fazhenyao/runs/rkda-vfirst-ordered-optimizations-20261029`。本地归档：`output/rkda-register-optimizations-20261030`。
+A5_ci证据目录：`<run-root>/rkda-register-optimizations-20261030`。A5_1构建、精度及仿真证据：`<run-root>/rkda-vfirst-ordered-optimizations-20261029`。本地归档：`output/rkda-register-optimizations-20261030`。
 
 ### 逐例正式均值
 

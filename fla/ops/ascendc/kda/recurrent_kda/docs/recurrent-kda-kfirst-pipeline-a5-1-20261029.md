@@ -19,7 +19,7 @@
 
 ## 采集方法与限制
 
-环境为 A5_1 `/home/fazhenyao/runs/rkda-a5-1-perf-20261028-1/env.sh`，CANN 9.2.0-beta.2，msopprof 26.2.0-f7e04b75a861916137c51cb9242a2ba123b6d94a。
+环境为 A5_1 `<run-root>/rkda-a5-1-perf-20261028-1/env.sh`，CANN 9.2.0-beta.2，msopprof 26.2.0-f7e04b75a861916137c51cb9242a2ba123b6d94a。
 
 真机物理卡4的公开入口和直接对象入口 PipeTimeline 采集均未得到有效 trace，停留在目标 kernel 启动阶段。设备日志曾出现 `prof_aicpu_grp` 查询失败、`Failed init profiling(-1)`；尚未确认这是唯一原因。本轮没有重置设备或更改共享环境，失败采集均已停止。
 
@@ -54,6 +54,6 @@ veccore0 的已导出区间：远程25.036 μs、当前19.418 μs。这是超时
 
 ## 结果位置
 
-- A5_1：`/home/fazhenyao/runs/rkda-kfirst-worst-pipeline-20261029/`。
-- 本机：[中文流水图](/D:/PROJECT/flash-linear-attention-npu/output/rkda-kfirst-pipeline-a5-1/kfirst-pipeline.png)、[原始证据包](/D:/PROJECT/flash-linear-attention-npu/output/rkda-kfirst-pipeline-a5-1/pipeline-evidence.tar.gz)、[统计 JSON](/D:/PROJECT/flash-linear-attention-npu/output/rkda-kfirst-pipeline-a5-1/pipeline-summary.json)。
+- A5_1：`<run-root>/rkda-kfirst-worst-pipeline-20261029/`。
+- 本机：[中文流水图](assets/kfirst-pipeline.png)、原始证据包（仅本地归档，未发布：`pipeline-evidence.tar.gz`，SHA256 `31ba26fed51f986651a4a3ec07ebb1abd9c4eaaae1de65060d4c7b4197046a6d`）、统计 JSON（仅本地归档，未发布：`pipeline-summary.json`，SHA256 `e03ba60370e21496b3f02cf624c4d8b63f6425fe26706c5043d8dc716a736970`）。
 - 本机目录含两版 `trace.json`、两个 AIV 的指令 CSV、日志、tiling、启动脚本和文件哈希索引。CSV 各7列，远程3639行、当前1886行；CSV 的行是聚合指令位置，不能当作动态执行次数。

@@ -82,7 +82,7 @@ python analyze.py
 
 初次启动因占用记录脚本缺少导入而提前退出，未生成144组结果，保存到 `failed-startup/` 并排除。修复后以manifest与目标kernel数量双重校验完整采集，不能只依据msprof退出状态判断成功。
 
-远端证据：`A5_ci:/home/fazhenyao123/runs/rkda-upstream-register-compare-20261030`。本地归档：`output/rkda-upstream-register-compare-20261030`。保留源码和二进制身份、原始op_summary、manifest、逐例占用、全部正式样本、分析脚本和报告。
+远端证据：`A5_ci:<run-root>/rkda-upstream-register-compare-20261030`。本地归档：`output/rkda-upstream-register-compare-20261030`。保留源码和二进制身份、原始op_summary、manifest、逐例占用、全部正式样本、分析脚本和报告。
 
 ## 逐例均值
 

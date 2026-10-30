@@ -61,7 +61,7 @@ A5_1，物理卡7，Ascend950PR，CANN 9.2.0-beta.2。每轮以标准单算子 `
 
 性能仅使用正常构建的 `msprof --task-time=on`，取目标 RecurrentKda 的 `Task Duration(us)`。每例3次预热、5次正式样本，实际56个 block；先20个典型组合，再以相同设备和脚本重测优化前后全部 issue680 的36组模型形状 × 两种 State 布局 × 两种 State dtype。不同流水计数器有重叠，不能相加；simulator 时间不作为真机性能验收值。
 
-开发结果与最终流水证据见下文。完整原始数据位于主工作区 `output/rkda-vfirst-ordered-optimizations-20261029`，A5_1 对应 `/home/fazhenyao/runs/rkda-vfirst-ordered-optimizations-20261029`。
+开发结果与最终流水证据见下文。完整原始数据位于主工作区 `output/rkda-vfirst-ordered-optimizations-20261029`，A5_1 对应 `<run-root>/rkda-vfirst-ordered-optimizations-20261029`。
 
 ## 分阶段结果
 

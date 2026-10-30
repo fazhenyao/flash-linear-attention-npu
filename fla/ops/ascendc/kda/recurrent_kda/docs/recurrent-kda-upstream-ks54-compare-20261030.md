@@ -7,7 +7,7 @@
 远程flashserve/main冻结为`2bb7e74ecf4876acbc4527070e403bffeef06e75`，提交信息：2026-10-30 18:04:58 +0800 feat(kda)!: 统一 A2/A3/A5 反向单 layout 与 beta_eff 接口 (#993)。本轮显式fetch refs/heads/main，随后git archive该完整提交，在A5_1新隔离目录实际重新构建recurrent_kda标准run并安装，没有复用早期远程版本的kernel包。
 当前为本轮开始已验收的ks54，来自codex/recurrent-kda-x8-pr工作树；18个实现/Python通路源文件与验收快照规范化SHA256一致，78个包so/o与ks54验收包逐项一致。四条路径分别使用ks54已选择的实现，不叠加未验收候选。当前X按请求最大有效长度在1/2/4/8中选择，本轮T恰为1/2/4/8，未强制全部取8。
 远程最新提交的完整源码tar SHA256为`8d1a4a3c446d3cc0b9b92209018ef730d97a9b8bdd1c54e8c32bdf778c7f8849`；解包后逐文件核验，标准构建安装、libcust_opapi/72 kernel对象/实际Python通路核验日志均保留。两版各78个so/o记录SHA256。当前ks54包未被覆盖，新venv只用于本轮构建与采集。
-环境：A5_1（179.223.2.2），Ascend950PR物理卡4/逻辑0，CANN 9.2.0-beta.2，Python 3.11.17，torch 2.9.0+cpu、torch_npu 2.9.0.post6。两版56 block、同卡串行采集，先逐路径单次正常启动并检查有限值；正常启动不冒充本轮CPU精度验收。
+环境：A5_1（<remote-host>），Ascend950PR物理卡4/逻辑0，CANN 9.2.0-beta.2，Python 3.11.17，torch 2.9.0+cpu、torch_npu 2.9.0.post6。两版56 block、同卡串行采集，先逐路径单次正常启动并检查有限值；正常启动不冒充本轮CPU精度验收。
 构建完成后的首次安装因新隔离venv未复制wheel的dist-info，更新RECORD时中断；补齐已有wheel元数据后，使用同一已构建run重新安装，核验通过后才开始性能采集。失败日志upstream-install-initial.log保留，没有因此重新编译或重复性能样本。1841个上游归档源文件逐项匹配git archive，当前18源文件核验通过。
 首次smoke在导入冻结输入脚本时缺少相邻common目录而提前退出，尚未运行算子或采集性能；补齐相同版本common后继续，失败日志upstream-smoke-initial.log保留。仅复用输入构造函数，没有启动ATK任务。
 
@@ -96,7 +96,7 @@ msprof --task-time=on，筛选OP Type=RecurrentKda的Task Duration(us)，验证D
 
 ## 执行入口与证据
 
-远端：`A5_1:/home/fazhenyao/runs/rkda-upstream-ks54-compare-20261030`。本地：`output/rkda-upstream-ks54-compare-20261030/`。
+远端：`A5_1:<run-root>/rkda-upstream-ks54-compare-20261030`。本地：`output/rkda-upstream-ks54-compare-20261030/`。
 
 ```bash
 # run.sh中：新venv、上游标准构建/安装、版本审计、逐路径smoke、两版串行msprof

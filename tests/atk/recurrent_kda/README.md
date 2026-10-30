@@ -147,7 +147,7 @@ mss `39e16928aa594b3a8d4ba09f690714b802e4b5010c192fbc45fba4586eacbaac`。
 | 安装核验 | 72个kernel .o、opapi和Python wrapper匹配构建源码 | `fla-680-a5-gatevf-md5.log` |
 
 交付前已恢复上述源码哈希对应的向量版本，重新安装保存的同一构建产物
-`/home/fazhenyao123/runs/fla-680-gatevf.run`；未保留Scalar实验版本作为安装结果。
+`<run-root>/fla-680-gatevf.run`；未保留Scalar实验版本作为安装结果。
 该run包SHA256为 `dd89ae1a7363aa744f8ad873281da5ebaafeb072d408acb54dac814e4431b03d`。
 `fla-680-a5-delivery-md5.log`再次核对全部72个kernel、opapi和wrapper通过，
 新Python进程重跑42项公开接口通过（`fla-680-a5-delivery-public.log`）。
@@ -227,8 +227,8 @@ T=4耗时为基线的约79.4%～80.9%，T=8为75.6%～76.2%；主要收益来自
 低于issue的200MB上限，计入输出、系统workspace及调用内连续化。
 该数字不能用于非原位的大state pool，后者还需复制整个初始state。
 
-证据保留于A5_ci：源码 `/home/fazhenyao123/src/fla-680-a5-port-20261020`，
-日志/报告根 `/home/fazhenyao123/runs/`。精度/perf在`fla-680-a5-atk-v5/`，
+证据保留于A5_ci：源码 `<user-home>/src/fla-680-a5-port-20261020`，
+日志/报告根 `<run-root>/`。精度/perf在`fla-680-a5-atk-v5/`，
 确定性/内存报告在源码的 `tests/atk/recurrent_kda/atk_output/`；
 性能根`fla-680-gatevf-ab-1-{old,new}-prof/`，各自manifest固定shape、属性、采样数，
 `op_summary*.csv`保存逐task时间，`fla-680-gatevf-ab-results.json`保存均值/中位数/标准差。
@@ -542,7 +542,7 @@ issue680全36形状×V/K-first×FP32/BF16 State=144组，每版1152条目标kern
 
 按V-first点积融合、K-first BF16打包、K-first点积与访存调度的顺序独立实验。最终layout26保留V-first点积融合，以及K-first BF16的AND打包、点积融合和成对加载/转换/计算交错。K-first FP32点积融合典型用例增加1.18%，访存交错无稳定收益，两者均回退。保留整tile完成后批量搬出out、State的UB类型、必要同步与预取。
 
-layout22～26均完成标准run构建安装、libcust_opapi校验、72对象审计和132+54例精度。最终layout26另外通过74项公开接口、9项确定性（每项3次）；标杆、值域与阈值未改。当前源码与构建源18文件核对通过，A5_1与A5_ci的468项so/o SHA256一致。完整小规模BF16 simulator中，V-first每token净减256条Vector算术，K-first每token另减128条打包位操作；必要归约和同步数量不变。此轮未重复内存检查，A2/A3未上板；静态扫描仍有114项既有host DFX-MESSAGE问题，两个修改的kernel头文件无发现。
+layout22～26均完成标准run构建安装、libcust_opapi校验、72对象审计和132+54例精度。最终layout26另外通过74项公开接口、9项确定性（每项3次）；标杆、值域与阈值未改。当前源码与构建源18文件核对通过，A5_1与A5_ci的468项so/o SHA256一致。完整小规模BF16 simulator中，V-first每token净减256条Vector算术，K-first每token另减128条打包位操作；必要归约和同步数量不变。此轮未重复内存检查，A2/A3未上板；静态扫描仍有当轮114项host DFX-MESSAGE问题，两个修改的kernel头文件无发现。
 
 A5_ci物理卡1，msprof Task Duration，每例3预热+5正式样本，issue680全36形状×V/K-first×FP32/BF16 State=144组。相对本轮开始的reg20，耗时比几何均值如下；此表不是与远程main的对比。
 
@@ -568,7 +568,7 @@ A5_ci物理卡1，msprof Task Duration，每例3预热+5正式样本。同卡对
 
 另采ID7三组控制：V-first FP32 +0.61%、V-first BF16 -0.15%、K-first BF16 +0.09%；未重新采集其它布局全部模型性能，不宣称所有布局性能完全相同。其它布局/dtype的算术路径保留。完整16token K-first FP32 simulator事件61762→45336（-26.60%），区间93.012→31.187μs，仅用于诊断。必要的逐token同步保留，vFloat scratch不再使用，其专用屏障减少16条。
 
-静态issue覆盖188项通过，仍有114项既有host DFX-MESSAGE发现，修改的kernel头文件无发现；A2/A3未上板，原始受保护方案未修改。逐例性能、指令与命令见[K-first FP32优化记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-kfirst-fp32-register-optimizations-20261030.md)。本地证据`output/rkda-kfirst-fp32-register-20261030/{a5-1,a5-ci}`，服务器沿用上一轮run目录，以kfp前缀区分。
+静态issue覆盖188项通过，仍有当轮114项host DFX-MESSAGE发现，修改的kernel头文件无发现；A2/A3未上板，原始受保护方案未修改。逐例性能、指令与命令见[K-first FP32优化记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-kfirst-fp32-register-optimizations-20261030.md)。本地证据`output/rkda-kfirst-fp32-register-20261030/{a5-1,a5-ci}`，服务器沿用上一轮run目录，以kfp前缀区分。
 
 ## 2026-10-30：K-first BF16连续V方向验证
 
@@ -578,7 +578,7 @@ A5_ci物理卡1，msprof Task Duration，每例3预热+5正式样本。同卡对
 
 A5_ci物理卡5，msprof Task Duration，3预热+5正式样本；严格串行重测kfp29与kbf30，覆盖issue680全36种形状的K-first BF16，耗时比几何均值**0.497276（-50.27%）**，36/36均更快，最大组内CV1.17%。ID7为737.222→342.829μs（-53.50%），ID35为4313.081→1989.751μs（-53.87%）。同采ID7控制：V-first FP32 -0.54%、V-first BF16基本持平、K-first FP32 -0.11%；未测其它布局全部模型性能。初次两版采集约1.076秒交叠，整对排除且原始记录保留；最终串行数据没有替换样本。此处基线是本轮kfp29，不是远程main。
 
-完整16token BF16 simulator事件59585→57613（-3.31%），区间56.941→30.027μs，仅作诊断；连续State读写消除Gather/Scatter、逐行归约与out收集依赖，额外BF16转换使总指令降幅较小。静态issue覆盖188项通过，既有114项host DFX-MESSAGE发现仍在，修改的kernel无发现；A2/A3未上板，受保护原方案未修改。
+完整16token BF16 simulator事件59585→57613（-3.31%），区间56.941→30.027μs，仅作诊断；连续State读写消除Gather/Scatter、逐行归约与out收集依赖，额外BF16转换使总指令降幅较小。静态issue覆盖188项通过，当轮114项host DFX-MESSAGE发现仍在，修改的kernel无发现；A2/A3未上板，受保护原方案未修改。
 
 精度/内存在A5_1卡6；完整逐例性能、指令、限制及命令见[BF16验证记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-kfirst-bf16-register-validation-20261030.md)。本地证据`output/rkda-kfirst-bf16-register-20261030/{a5-1,a5-ci}`，服务器沿用`rkda-layout-register-optimizations-20261030`，以kbf前缀区分。
 
@@ -590,7 +590,7 @@ A5_ci物理卡5，msprof Task Duration，每例3预热+5正式样本。issue680 
 
 完整16token BF16 simulator：kbf30为50192事件/32.422μs，vf31为48403/40.311μs，vf32为50451/32.848μs，仅用于诊断。vf31静态减少指令却增加prediction打包依赖；vf32省去scratch写读和专用屏障，但寄存器Gather/轮换没有净收益。两版均未减少逐行归约；不能据此声称V-first已无其它优化空间。
 
-当前本地和A5_1源已恢复kbf30，隔离venv通过原run包重新安装，18源文件及78个已安装so/o身份一致；保留此前已验收的K-first FP32/BF16优化。受保护原方案及正式设计未因淘汰候选改变。静态issue覆盖188项通过，114项既有host DFX-MESSAGE发现仍在，实验kernel头文件无发现；A2/A3未上板。精度/正常启动在A5_1卡6，完整逐例结果及指令见[V-first候选记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-vfirst-delta-register-validation-20261030.md)。本地证据`output/rkda-vfirst-delta-register-20261030/{a5-1,a5-ci}`，服务器沿用前轮run目录，以vf前缀区分。
+当前本地和A5_1源已恢复kbf30，隔离venv通过原run包重新安装，18源文件及78个已安装so/o身份一致；保留此前已验收的K-first FP32/BF16优化。受保护原方案及正式设计未因淘汰候选改变。静态issue覆盖188项通过，当轮114项host DFX-MESSAGE发现仍在，实验kernel头文件无发现；A2/A3未上板。精度/正常启动在A5_1卡6，完整逐例结果及指令见[V-first候选记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-vfirst-delta-register-validation-20261030.md)。本地证据`output/rkda-vfirst-delta-register-20261030/{a5-1,a5-ci}`，服务器沿用前轮run目录，以vf前缀区分。
 
 ## 2026-10-30：V-first State两遍读取验证
 
@@ -613,7 +613,7 @@ v2r33和v2r34各通过标准run构建安装、libcust_opapi MD5及72对象核对
 
 正式包小规模完整16token simulator中，v2r34 FP32事件42016→46328、区间30.004→27.560μs，BF16事件50192→58576、区间32.422→30.692μs。State额外Load/Cast及prediction收集使指令增加，收益来自依赖组织和生命周期改善；逐行VCADD未减少，不据此宣称总指令下降。仿真只用于诊断，模型性能采用上方真机msprof数据。
 
-静态issue覆盖188项通过；仍有114项既有host DFX-MESSAGE发现，两个修改kernel头文件无发现；A2/A3未上板。正式设计已同步采用的计算路径，受保护原方案未修改，开发期validation记录已收敛删除。完整72组逐例性能、命令、指令及限制见[两遍读取验证记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-vfirst-two-pass-validation-20261030.md)。本机证据`output/rkda-vfirst-two-pass-20261030/{a5-1,a5-ci}`及两zip逐文件SHA256索引；服务器沿用`rkda-layout-register-optimizations-20261030`，以v2r前缀区分。
+静态issue覆盖188项通过；仍有当轮114项host DFX-MESSAGE发现，两个修改kernel头文件无发现；A2/A3未上板。正式设计已同步采用的计算路径，受保护原方案未修改，开发期validation记录已收敛删除。完整72组逐例性能、命令、指令及限制见[两遍读取验证记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-vfirst-two-pass-validation-20261030.md)。本机证据`output/rkda-vfirst-two-pass-20261030/{a5-1,a5-ci}`及两zip逐文件SHA256索引；服务器沿用`rkda-layout-register-optimizations-20261030`，以v2r前缀区分。
 
 ## 2026-10-30 当前v2r34与远程main补充采集：共享占用，未形成可靠整体结论
 
@@ -639,7 +639,7 @@ A5_ci物理卡1/逻辑0，同卡串行msprof Task Duration；issue680 ID0/1/2/7/
 
 A5_1物理卡4/逻辑0，同卡串行msprof，issue680全36形状×四路径144组，3预热+5正式，Task Duration均值；全组前后均记录共享进程，按用户授权继续。相对v2r34耗时比几何均值：V-first BF16 0.987935（-1.21%）、FP32 0.995881（-0.41%）；T8分别-1.74%/-0.97%。K-first FP32 0.999735、BF16 0.999994，计算流程保持；最大组内CV1.87%，不宣称全部case加速。两版CSV各2304行×48列，其中目标各1152条，56 block，未挑选样本。
 
-完整小规模BF16 V-first simulator：B2/H=HV1/T8/X8/一个AIV，完整16token。两版RV指令调用均56454，全部指令种类的调用数逐项相同；VF累计39343→38597周期（-1.90%），支持调度改善，未直接测得双发率。静态188 issue覆盖通过；114项既有host DFX发现保持，kernel无新发现，A2/A3未上板。原方案未修改。完整144组逐例结果、命令、精度/内存范围及265文件SHA256归档见[分路径优化记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-dual-issue-optimizations-20261030.md)，证据为`output/rkda-dual-issue-20261030/`。
+完整小规模BF16 V-first simulator：B2/H=HV1/T8/X8/一个AIV，完整16token。两版RV指令调用均56454，全部指令种类的调用数逐项相同；VF累计39343→38597周期（-1.90%），支持调度改善，未直接测得双发率。静态188 issue覆盖通过；当轮114项host DFX发现保持，kernel无新发现，A2/A3未上板。原方案未修改。完整144组逐例结果、命令、精度/内存范围及265文件SHA256归档见[分路径优化记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-dual-issue-optimizations-20261030.md)，证据为`output/rkda-dual-issue-20261030/`。
 
 ## 2026-10-30 四路径独立VF实验（ks54）
 
@@ -651,7 +651,7 @@ A5_1物理卡4/逻辑0，正常标准构建包，同卡串行msprof RecurrentKda
 
 ks54正式186项精度（132原有+54对齐）、74契约、9确定性各3次通过；四路径小规模正式原生对象out/State共8项与vuf43逐位一致。当前Pipeline sanitizer探针10组No error detected，均bad_out=0 bad_state=0且HOST_FINALIZED：四路径×最终State/快照、X8/T9共8组，另有K-first两dtype X1/T1快照2组。该内存证据为state_pipeline_probe入口。首次辅助内存脚本CRLF失败日志保留，改LF后补跑完成；未重复已通过的精度和模型性能。
 
-标准run安装、72对象、18源码及78已安装so/o身份核对通过。完整16token K-first BF16 simulator事件57623→55658，区间29.792→29.561μs；每token少128次VSELR及128次VADDS，增加128次VLD、2次VSTI、1次SMEM_BAR，未直接测得双发率。静态188 issue覆盖通过，仍有114项既有host DFX发现，kernel无新发现；A2/A3未上板。原方案SHA256保持不变，正式design.md同步系数scratch生命周期，临时validation记录收敛删除。
+标准run安装、72对象、18源码及78已安装so/o身份核对通过。完整16token K-first BF16 simulator事件57623→55658，区间29.792→29.561μs；每token少128次VSELR及128次VADDS，增加128次VLD、2次VSTI、1次SMEM_BAR，未直接测得双发率。静态188 issue覆盖通过，仍有当轮114项host DFX发现，kernel无新发现；A2/A3未上板。原方案SHA256保持不变，正式design.md同步系数scratch生命周期，临时validation记录收敛删除。
 
 完整逐例数据、所有候选撤回依据、命令及限制见[四路径独立优化记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-four-path-vf-optimizations-20261030.md)。本地证据`output/rkda-four-path-vf-20261030/`，其中a5-1-evidence.zip含577文件及逐文件SHA256索引，CRC和全部hash核验通过。
 
@@ -668,3 +668,15 @@ A5_1物理卡4/逻辑0，CANN 9.2.0-beta.2，同卡串行msprof Task Duration；
 | k-fp32 | 0.350022 | -65.00% | 36/36 |
 
 最大组内CV为2.51%，共享条件下采集，不声明独占设备绝对性能。逐例样本、占用、异常与限制均保留，不用总体均值代替逐case判断。完整原始144组及按T汇总见[本轮记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-upstream-ks54-compare-20261030.md)；本机证据`output/rkda-upstream-ks54-compare-20261030/`，436文件zip的CRC及SHA256索引全部通过。首次安装缺少wheel元数据、首次smoke缺少common输入辅助目录的失败日志保留，均在正式性能采集前修正，未据此重复模型性能。
+
+## 2026-10-30 PR #997 检视整改验收
+
+修复非原位 State 未写槽、旧形状调用兼容、公开参数结构化错误及负向断言，整理公开报告和资产。冻结方案未修改。A5_1 上完整 wheel 构建、标准 run 安装及 libcust_opapi MD5 核对通过，22个构建源文件与78个已安装 so/o 身份核对通过。
+
+原有132项与对齐54项正式精度全部 SUCCESS，CPU 精度字段全部为 true，未改变 CPU 标杆、值域或容差。stable、ctypes、直接 ACLNN 三入口共48项正常场景通过，覆盖两布局/两 dtype 的空请求、稀疏 pool、非零 State offset 和旧形状别名；18项负向检查断言具体返回码/消息，每次拒绝后合法调用及 CPU 对比通过。74项公开契约及 mutation/grad 通过。
+
+本轮72个设备对象与已验收 ks54 全部 SHA256 相同，kernel、X、bank 同步和整 tile out 批量搬出保持；按用户要求不重复 msprof，上一节144组仍是历史性能记录。非原位复制、旧别名物化及新增 host 校验的端到端开销未测，不由对象一致性推断为不变。A2/A3、整体 Example/ST 和新 head 正式 CI 未执行。
+
+静态192项 issue/21条规则覆盖通过；剩余36个 DFX 机械命中已区分内部失败与已结构化叶子的传播，10个敏感项为命令误匹配，3个断链在受保护方案中，未宣称零发现。历史114项是当轮扫描位置，其中19个位于 PR 新增行，不能统称为 PR 前已有问题。新增测试命令、逐项整改与限制见[检视整改记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-review-fixes-20261030.md)。
+
+私有证据 `output/rkda-review-fixes-20261030/evidence.zip` 共94文件，CRC 和逐文件 SHA256 全部通过；包 SHA256 为 `9bfa902ab698ac968139c03df9703ac9df348f3594c3d53306767101ff7a7caf`。包含正式精度任务行、日志、对象/源文件身份和复现脚本；不作为公共可点击工件。开发期 validation.md 已归并删除，受保护方案内的历史引用按用户要求保留。

@@ -65,7 +65,7 @@
 
 A5_1 物理卡7，正常标准 run 包，msprof `Task Duration(us)`，每例3次预热、5次样本。每个候选先跑20个典型组合，再根据结果决定是否扩展到 issue680 全144组。精度沿用132个原有用例和54个对齐用例；涉及 scratch 或同步时补充8组原生 sanitizer/trace。
 
-每轮结果记录在本文件对应候选下，并保留远程目录 `/home/fazhenyao/runs/rkda-vfirst-ordered-optimizations-20261029` 的原始 CSV、manifest、日志和构建审计。
+每轮结果记录在本文件对应候选下，并保留远程目录 `<run-root>/rkda-vfirst-ordered-optimizations-20261029` 的原始 CSV、manifest、日志和构建审计。
 
 ## 最终回退确认
 

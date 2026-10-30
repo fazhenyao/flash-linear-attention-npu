@@ -47,7 +47,7 @@ A5_1物理卡4映射逻辑0，Ascend950PR、CANN 9.2.0-beta.2，Python 3.11.17�
 - 最终74项公开契约、9项确定性（每项3次）通过，并逐行验证正式报告。第一次确定性调用因私有脚本覆盖PYTHONPATH导致acl导入失败，ATK错误地返回0且报告汇总异常；该次9项未执行，不计通过。保留失败日志，恢复CANN Python路径后的补跑报告9项均SUCCESS、确定性计算结果均true。
 - 当前Pipeline头文件编译的sanitizer探针，FP32/BF16×两layout×最终State/逐token快照8组均No error detected，out/State检查通过；X8、每请求T9，覆盖跨tile和bank复用。该证据来自state_pipeline_probe入口。
 - 每轮标准单算子run构建和--install、libcust_opapi MD5、72对象/元数据/构建产物SHA256核对通过；最终18源文件及78个已安装so/o逐项核对成功。未修改共享Conda。
-- 静态issue覆盖188项通过，仍有114项既有host DFX-MESSAGE发现；本轮修改的kernel无发现。A2/A3没有上板。
+- 静态issue覆盖188项通过，仍有当轮114项host DFX-MESSAGE发现；本轮修改的kernel无发现。A2/A3没有上板。
 
 ## BF16 V-first完整小规模仿真
 
@@ -61,7 +61,7 @@ A5_1物理卡4映射逻辑0，Ascend950PR、CANN 9.2.0-beta.2，Python 3.11.17�
 
 ## 归档与复现
 
-本机证据：output/rkda-dual-issue-20261030/。包含六个候选源码、最终selected源码、prepare/deploy/构建/精度/性能/校验脚本、原始CSV、样本及占用manifest、正式精度/确定性报告、内存日志、两份完整小规模trace、78产物SHA256及vuf43.tgz。evidence.zip的265个条目已逐文件验证大小和SHA256。服务端为/home/fazhenyao/runs/rkda-dual-issue-20261030。
+本机证据：output/rkda-dual-issue-20261030/。包含六个候选源码、最终selected源码、prepare/deploy/构建/精度/性能/校验脚本、原始CSV、样本及占用manifest、正式精度/确定性报告、内存日志、两份完整小规模trace、78产物SHA256及vuf43.tgz。evidence.zip的265个条目已逐文件验证大小和SHA256。服务端为<run-root>/rkda-dual-issue-20261030。
 
 ```bash
 bash run-round.sh <候选名>
