@@ -441,7 +441,7 @@ bool CheckShape(const RecurrentKdaParams &params, bool varlen)
             return false;
         }
     }
-    if (params.safeGate && (params.lowerBound < -5.0 || params.lowerBound >= 0.0)) {
+    if (params.safeGate && !(params.lowerBound >= -5.0 && params.lowerBound < 0.0)) {
         ReportInvalid(params, "lower_bound", "npu_recurrent_kda: lower_bound must be in [-5, 0) when safe_gate=True.");
         return false;
     }
@@ -620,10 +620,11 @@ void SetInputOriginalShape(RecurrentKdaParams &params)
 // The public ABI accepts a device Tensor, whereas value-dependent tiling needs
 // host data. Workspace creation has no stream argument: synchronize before D2H,
 // then give the executor an owned host constant (also copied to GM for kernel use).
-aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *executor)
+aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *executor, bool &synchronized)
 {
     const auto *cu = params.cuSeqlensOptional;
-    if (cu == nullptr || GetCurrentPlatformInfo().GetSocVersion() != SocVersion::ASCEND950)
+    if (cu == nullptr || (GetCurrentPlatformInfo().GetSocVersion() != SocVersion::ASCEND950 &&
+                          params.ssmStateIndicesOptional == nullptr))
         return ACLNN_SUCCESS;
     const int64_t count = cu->GetViewShape().GetDim(0);
     const int64_t stride = cu->GetViewStrides()[0];
@@ -648,6 +649,7 @@ aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *exec
         auto ret = aclrtSynchronizeDevice();
         CHECK_COND(ret == ACL_SUCCESS, ACLNN_ERR_RUNTIME_ERROR,
                    "cu_seqlens host value dependency requires device synchronization; runtime status=%d.", ret);
+        synchronized = true;
         ret = aclrtMemcpy(storage.data(), bytes, source, bytes, ACL_MEMCPY_DEVICE_TO_HOST);
         CHECK_COND(ret == ACL_SUCCESS, ACLNN_ERR_RUNTIME_ERROR,
                    "cu_seqlens device-to-host copy failed; bytes=%lu, runtime status=%d.", bytes, ret);
@@ -678,6 +680,157 @@ aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *exec
     for (int64_t i = 0; i < count; ++i)
         std::memcpy(destination + i * width, storage.data() + uint64_t(i) * stride * width, width);
     params.cuSeqlensOptional = host;
+    return ACLNN_SUCCESS;
+}
+
+// Describe only live entries: padding tokens and empty requests are not read.
+struct MetadataSlice {
+    uint64_t sourceOffset, destinationOffset, count, stride;
+};
+
+int64_t IntegerMetadataValue(const aclTensor *tensor, uint64_t index)
+{
+    const auto *data = static_cast<const uint8_t *>(tensor->GetData());
+    if (tensor->GetDataType() == DataType::DT_INT32) {
+        int32_t value;
+        std::memcpy(&value, data + index * sizeof(value), sizeof(value));
+        return value;
+    }
+    int64_t value;
+    std::memcpy(&value, data + index * sizeof(value), sizeof(value));
+    return value;
+}
+
+aclnnStatus SnapshotMetadata(const aclTensor *&tensor, const char *name,
+                            const std::vector<MetadataSlice> &slices,
+                            aclOpExecutor *executor, bool &synchronized)
+{
+    if (tensor == nullptr) return ACLNN_SUCCESS;
+    const uint64_t width = tensor->GetDataType() == DataType::DT_INT32 ? 4 : 8;
+    const uint64_t limit = std::numeric_limits<uint64_t>::max() / width;
+    uint64_t elements = 1, span = 1;
+    bool representable = tensor->GetViewOffset() >= 0;
+    for (size_t d = 0; d < tensor->GetViewShape().GetDimNum(); ++d) {
+        const uint64_t size = tensor->GetViewShape().GetDim(d);
+        const int64_t stride = tensor->GetViewStrides()[d];
+        if (size == 0 || stride < 0 || elements > limit / size ||
+            (size > 1 && uint64_t(stride) > (limit - span) / (size - 1))) {
+            representable = false;
+            break;
+        }
+        elements *= size;
+        span += (size - 1) * uint64_t(stride);
+    }
+    if (!representable || uint64_t(tensor->GetViewOffset()) > limit - span) {
+        OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON("aclnnRecurrentKda", name,
+            "nonnegative strides/offset and representable metadata span required; actual " + TensorDescription(tensor));
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    auto *host = executor->AllocHostTensor(tensor->GetViewShape(), tensor->GetDataType());
+    CHECK_RET(host != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    auto *destination = static_cast<uint8_t *>(host->GetData());
+    std::memset(destination, 0, elements * width);
+    const auto *source = static_cast<const uint8_t *>(tensor->GetData());
+    const bool onHost = gert::TensorPlacementUtils::IsOnHost(tensor->GetPlacement());
+    if (!onHost && !slices.empty() && !synchronized) {
+        const auto status = aclrtSynchronizeDevice();
+        CHECK_COND(status == ACL_SUCCESS, ACLNN_ERR_RUNTIME_ERROR,
+                   "State metadata validation requires device synchronization; runtime status=%d.", status);
+        synchronized = true;
+    }
+    for (const auto &slice : slices) {
+        if (slice.count == 0) continue;
+        const uint64_t bytes = ((slice.count - 1) * slice.stride + 1) * width;
+        std::vector<uint8_t> storage(bytes);
+        if (onHost) std::memcpy(storage.data(), source + slice.sourceOffset * width, bytes);
+        else {
+            const auto status = aclrtMemcpy(storage.data(), bytes, source + slice.sourceOffset * width,
+                                           bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+            CHECK_COND(status == ACL_SUCCESS, ACLNN_ERR_RUNTIME_ERROR,
+                       "State metadata device-to-host copy failed; bytes=%lu, runtime status=%d.", bytes, status);
+        }
+        for (uint64_t i = 0; i < slice.count; ++i)
+            std::memcpy(destination + (slice.destinationOffset + i) * width,
+                        storage.data() + i * slice.stride * width, width);
+    }
+    tensor = host;
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus MaterializeStateMetadata(RecurrentKdaParams &params, aclOpExecutor *executor, bool &synchronized)
+{
+    const auto *indices = params.ssmStateIndicesOptional;
+    if (indices == nullptr) return ACLNN_SUCCESS;
+    const bool packed = params.cuSeqlensOptional != nullptr;
+    const int64_t requests = packed ? Dim(params.cuSeqlensOptional, 0) - 1 : Dim(params.query, 0);
+    const int64_t denseLength = packed ? 0 : Dim(params.query, 1);
+    const bool speculative = Rank(indices) == 2;
+    std::vector<MetadataSlice> indexSlices, acceptedSlices;
+    std::vector<int64_t> begins(requests), lengths(requests);
+    for (int64_t b = 0; b < requests; ++b) {
+        const int64_t begin = packed ? IntegerMetadataValue(params.cuSeqlensOptional, b) : b * denseLength;
+        const int64_t end = packed ? IntegerMetadataValue(params.cuSeqlensOptional, b + 1) : begin + denseLength;
+        begins[b] = begin;
+        lengths[b] = end - begin;
+        if (begin == end) continue;
+        if (speculative && end - begin > Dim(indices, 1)) {
+            ReportInvalid(params, "ssm_state_indices", "request=%ld, actual length=%ld exceeds max_step=%ld.",
+                          b, end - begin, Dim(indices, 1));
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+        const uint64_t sourceOffset = speculative ? uint64_t(b) * uint64_t(indices->GetViewStrides()[0]) :
+                                                  uint64_t(begin) * uint64_t(indices->GetViewStrides()[0]);
+        const uint64_t targetOffset = speculative ? b * Dim(indices, 1) : begin;
+        indexSlices.push_back({sourceOffset, targetOffset, uint64_t(end - begin),
+                              uint64_t(indices->GetViewStrides()[speculative ? 1 : 0])});
+        if (params.numAcceptedTokensOptional != nullptr)
+            acceptedSlices.push_back({uint64_t(b) * uint64_t(params.numAcceptedTokensOptional->GetViewStrides()[0]),
+                                      uint64_t(b), 1, 1});
+    }
+    auto status = SnapshotMetadata(params.ssmStateIndicesOptional, "ssm_state_indices", indexSlices,
+                                   executor, synchronized);
+    if (status != ACLNN_SUCCESS) return status;
+    status = SnapshotMetadata(params.numAcceptedTokensOptional, "num_accepted_tokens", acceptedSlices,
+                              executor, synchronized);
+    if (status != ACLNN_SUCCESS) return status;
+    const int64_t capacity = Dim(params.initialStateRef, 0);
+    for (int64_t b = 0; b < requests; ++b) {
+        if (lengths[b] == 0) continue;
+        if (params.numAcceptedTokensOptional != nullptr) {
+            const int64_t accepted = IntegerMetadataValue(params.numAcceptedTokensOptional, b);
+            if (accepted <= 0 || accepted > lengths[b]) {
+                ReportInvalid(params, "num_accepted_tokens", "request=%ld, actual=%ld, expected [1,length=%ld].",
+                              b, accepted, lengths[b]);
+                return ACLNN_ERR_PARAM_INVALID;
+            }
+        }
+        for (int64_t t = 0; t < lengths[b]; ++t) {
+            const uint64_t offset = speculative ? b * Dim(params.ssmStateIndicesOptional, 1) + t : begins[b] + t;
+            const int64_t slot = IntegerMetadataValue(params.ssmStateIndicesOptional, offset);
+            if (slot < 0 || slot >= capacity) {
+                ReportInvalid(params, "ssm_state_indices", "request=%ld, token=%ld, actual=%ld, expected [0,capacity=%ld).",
+                              b, t, slot, capacity);
+                return ACLNN_ERR_PARAM_INVALID;
+            }
+        }
+    }
+    return ACLNN_SUCCESS;
+}
+
+// Plain ND/rank-inferred formats share storage. Copy only the logical extent,
+// while retaining the destination's offset, outer strides and format tags.
+aclnnStatus CopyStateView(const aclTensor *source, const aclTensor *destination, aclOpExecutor *executor)
+{
+    source = l0op::Contiguous(source, executor);
+    CHECK_RET(source != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    auto *copySource = executor->CreateView(source, source->GetViewShape(), source->GetViewOffset());
+    CHECK_RET(copySource != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    copySource->SetStorageShape(source->GetViewShape());
+    copySource->SetOriginalShape(source->GetViewShape());
+    copySource->SetStorageFormat(destination->GetStorageFormat());
+    copySource->SetViewFormat(destination->GetViewFormat());
+    copySource->SetOriginalFormat(destination->GetOriginalFormat());
+    CHECK_RET(l0op::ViewCopy(copySource, destination, executor) != nullptr, ACLNN_ERR_INNER_NULLPTR);
     return ACLNN_SUCCESS;
 }
 
@@ -744,8 +897,8 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     // so this path must rebuild instead of returning a cached executor.
     if (CheckPhase1Params(executor, workspaceSize) != ACLNN_SUCCESS)
         return ACLNN_ERR_PARAM_NULLPTR;
-    const bool valueDependent = cuSeqlensOptional != nullptr &&
-        GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND950;
+    const bool valueDependent = ssmStateIndicesOptional != nullptr ||
+        (cuSeqlensOptional != nullptr && GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND950);
     L2_DFX_PHASE_1_WITHOUT_CACHE(aclnnRecurrentKda,
                    DFX_IN(query, key, value, gate, beta, initialStateRef, cuSeqlensOptional,
                           ssmStateIndicesOptional, aLogOptional, dtBiasOptional, numAcceptedTokensOptional,
@@ -802,8 +955,11 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     const bool queryNeedsContiguous = !querySupportsDirect;
     const bool keyNeedsContiguous = !keySupportsDirect;
     const bool valueNeedsContiguous = !valueSupportsDirect;
-    const auto cuStatus = MaterializeCuSeqlens(params, executorPtr);
+    bool metadataSynchronized = false;
+    const auto cuStatus = MaterializeCuSeqlens(params, executorPtr, metadataSynchronized);
     if (cuStatus != ACLNN_SUCCESS) return cuStatus;
+    const auto metadataStatus = MaterializeStateMetadata(params, executorPtr, metadataSynchronized);
+    if (metadataStatus != ACLNN_SUCCESS) return metadataStatus;
     CHECK_RET(PreProcess(params, queryNeedsContiguous, keyNeedsContiguous, valueNeedsContiguous, executorPtr) ==
                   ACLNN_SUCCESS,
               ACLNN_ERR_PARAM_INVALID);
@@ -843,20 +999,7 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     // before recurrence; the executor orders both writes to the same output.
     if (!params.inplaceFinalState && params.outputFinalState &&
         !SameTensorView(params.initialStateRef, params.finalState)) {
-        const auto *source = l0op::Contiguous(initialStateForKernel, executorPtr);
-        CHECK_RET(source != nullptr, ACLNN_ERR_INNER_NULLPTR);
-        // A contiguous singleton view may still own a larger backing storage.
-        // Copy its logical extent, not unrelated pool padding from that storage.
-        auto *copySource = executorPtr->CreateView(source, source->GetViewShape(), source->GetViewOffset());
-        CHECK_RET(copySource != nullptr, ACLNN_ERR_INNER_NULLPTR);
-        copySource->SetStorageShape(source->GetViewShape());
-        copySource->SetOriginalShape(source->GetViewShape());
-        // ND and the rank-inferred plain formats have identical physical
-        // storage here. ViewCopy requires matching format tags on both views.
-        copySource->SetStorageFormat(finalStateForKernel->GetStorageFormat());
-        copySource->SetViewFormat(finalStateForKernel->GetViewFormat());
-        copySource->SetOriginalFormat(finalStateForKernel->GetOriginalFormat());
-        CHECK_RET(l0op::ViewCopy(copySource, finalStateForKernel, executorPtr) != nullptr,
+        CHECK_RET(CopyStateView(initialStateForKernel, finalStateForKernel, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
     }
     auto result = l0op::RecurrentKda(
@@ -872,7 +1015,7 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
               ACLNN_ERR_INNER_NULLPTR);
     if (params.inplaceFinalState && params.outputFinalState &&
         !SameTensorView(params.finalState, params.initialStateRef)) {
-        CHECK_RET(l0op::ViewCopy(result[1], params.finalState, executorPtr) != nullptr,
+        CHECK_RET(CopyStateView(result[1], finalStateForKernel, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
     }
 

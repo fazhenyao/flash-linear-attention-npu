@@ -61,7 +61,7 @@ out, final_state = recurrent_kda(
   相邻差值是各序列长度。A5 host 读取其值，以最大有效序列长度从 `{1,2,4,8}` 选择共用 X，上限8；全空取1。
   当前 ACLNN 第一阶段同步设备并复制该元数据到 host，executor 保存本次值；packed 模式不支持在 ACLGraph 捕获中调用，修改边界后须重新创建 executor。固定长度路径不增加这次同步和复制。
 - `ssm_state_indices` 支持 packed `[T]` 和 speculative `[seq_num,max_step]`。显式索引模式允许 `state_capacity > seq_num`，并仅更新命中的槽。
-- 空序列不读取索引或 state，适用于 packed batch 中的 padding sequence。
+- 空序列不读取索引或 state，适用于 packed batch 中的 padding sequence。活跃 indices/accepted 由 host 校验并保存本次 executor 的快照；此类调用需要读取设备元数据，不支持 ACLGraph 捕获，修改后须重新创建 executor。无 indices 的调用不增加该检查开销。
 
 每个 token 的 recurrent 更新为：
 

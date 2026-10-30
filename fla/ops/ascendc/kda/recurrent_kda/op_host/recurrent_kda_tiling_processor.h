@@ -670,7 +670,7 @@ private:
                     ReportInvalid("query/key/value/gate/beta", "HV must be divisible by H, but HV=%u and H=%u.",
                             tiling.nv, tiling.nk),
                     return ge::GRAPH_FAILED);
-        OP_CHECK_IF(tiling.safeGate && (tiling.lowerBound < -5.0f || tiling.lowerBound >= 0.0f),
+        OP_CHECK_IF(tiling.safeGate && !(tiling.lowerBound >= -5.0f && tiling.lowerBound < 0.0f),
                     ReportInvalid("lower_bound", "lower_bound must be in [-5, 0) when safe_gate is true."),
                     return ge::GRAPH_FAILED);
         return ge::GRAPH_SUCCESS;

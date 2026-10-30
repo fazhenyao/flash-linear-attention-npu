@@ -57,9 +57,12 @@ def main():
     for backend, call in backends.items():
         for v_first in (True, False):
             for dtype in ("fp32", "bf16"):
-                for scenario in ("empty_request", "sparse_pool", "rank3_no_cu", "rank4_cu"):
+                for scenario in ("empty_request", "sparse_pool", "rank3_no_cu", "rank4_cu",
+                                 "inplace_independent_dense", "inplace_independent_gapped"):
+                    if scenario.startswith("inplace_independent") and backend != "aclnn":
+                        continue
                     spec = base_spec(B=2, T=2, H=1, HV=1, state_dtype=dtype,
-                                     state_v_first=v_first, inplace=False, pattern="signal",
+                                     state_v_first=v_first, inplace=scenario.startswith("inplace_independent"), pattern="signal",
                                      use_qk_l2norm_in_kernel=True, strided_state=True)
                     if scenario == "empty_request":
                         spec.update(lengths=[0, 2])
@@ -73,7 +76,7 @@ def main():
                     # and gapped outer stride on each entry.
                     backing = torch.zeros((state.shape[0] + 2, 2, 128, 128),
                                           dtype=state.dtype, device=device)
-                    inputs["initial_state"] = backing[1:-1, :1]
+                    inputs["initial_state"] = (state.clone() if scenario == "inplace_independent_dense" else backing[1:-1, :1])
                     inputs["initial_state"].copy_(state)
                     before = inputs["initial_state"].clone()
                     if scenario.startswith("rank"):
@@ -94,7 +97,7 @@ def main():
                     assert compare.compute_accuracy_result(
                         output.cpu().reshape(golden[0].shape), golden[0].float(), "output_0.pt").result
                     assert compare.compute_accuracy_result(final.cpu(), golden[1].float(), "output_1.pt").result
-                    assert torch.equal(inputs["initial_state"], before)
+                    assert torch.equal(inputs["initial_state"], final if spec.get("inplace") else before)
                     assert final.data_ptr() != inputs["initial_state"].data_ptr()
                     if scenario == "empty_request":
                         assert torch.equal(final[0], before[0])
@@ -106,10 +109,17 @@ def main():
                     print("REVIEW_CASE_OK", backend, v_first, dtype, scenario, flush=True)
     rejected = 0
     for backend, call in backends.items():
-        for invalid in ("head_ratio", "q_dtype", "state_stride", "cu_start", "cu_order", "cu_capacity"):
+        for invalid in ("head_ratio", "q_dtype", "state_stride", "cu_start", "cu_order", "cu_capacity",
+                        "slot_negative", "slot_capacity", "accepted_zero", "accepted_length",
+                        "short_speculative", "lower_nan", "lower_neginf", "lower_posinf"):
             # Non-inplace stable calls intentionally clone/materialize State.
             # Exercise illegal kernel strides through the inplace path instead.
             spec = base_spec(T=2, HV=3 if invalid == "head_ratio" else 4, inplace=invalid == "state_stride")
+            if invalid.startswith(("slot_", "accepted_")) or invalid == "short_speculative":
+                spec.update(indices="speculative" if invalid == "short_speculative" else "packed")
+            if invalid.startswith("lower_"):
+                spec.update(a_log=True, safe_gate=True, lower_bound={
+                    "lower_nan": float("nan"), "lower_neginf": -float("inf"), "lower_posinf": float("inf")}[invalid])
             inputs = build_inputs(spec, device)
             reason = "HV must be divisible by H"
             if invalid == "q_dtype":
@@ -124,13 +134,24 @@ def main():
                 offsets = {"cu_start": [1, 2], "cu_order": [0, -1], "cu_capacity": [0, 3]}[invalid]
                 inputs["cu_seqlens"] = torch.tensor(offsets, dtype=torch.int64, device=device)
                 reason = "cu_seqlens"
+            elif invalid.startswith("slot_"):
+                inputs["ssm_state_indices"].fill_(-1 if invalid == "slot_negative" else inputs["initial_state"].shape[0])
+                reason = "ssm_state_indices"
+            elif invalid.startswith("accepted_"):
+                inputs["num_accepted_tokens"].fill_(0 if invalid == "accepted_zero" else spec["T"] + 1)
+                reason = "num_accepted_tokens"
+            elif invalid == "short_speculative":
+                inputs["ssm_state_indices"] = inputs["ssm_state_indices"][:, :1]
+                reason = "ssm_state_indices"
+            elif invalid.startswith("lower_"):
+                reason = "lower_bound"
             try:
                 call(**inputs, **call_options(spec))
                 torch.npu.synchronize()
             except (RuntimeError, ValueError) as exc:
                 message = str(exc)
                 assert reason in message, (backend, invalid, message)
-                python_guard = backend == "ctypes" and invalid in ("head_ratio", "q_dtype")
+                python_guard = backend == "ctypes" and (invalid in ("head_ratio", "q_dtype") or invalid.startswith("lower_"))
                 if not python_guard:
                     assert "161002" in message, (backend, invalid, message)
                 if invalid.startswith("cu_"):

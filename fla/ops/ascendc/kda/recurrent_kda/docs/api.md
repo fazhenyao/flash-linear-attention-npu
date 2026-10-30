@@ -209,7 +209,9 @@ recurrent_kda<<<blockDim, nullptr, stream>>>(
   回退连续化；token/head 置换或正 stride 重叠 descriptor 返回参数错误。
 - 未传 `ssm_state_indices` 时 `state_capacity=seq_num`；传入后容量可大于序列数，所有有效 slot 必须位于 `[0,state_capacity)`。
 - `ssm_state_indices` 支持 packed `[T]` 和 speculative `[seq_num,max_step]`；活跃序列不得共享正在写入的 state slot。
-- 空序列不读取 `ssm_state_indices/num_accepted_tokens`，也不读写 state pool。
+- `num_accepted_tokens[b]` 对非空请求须在 `[1, length[b]]` 内，只选择初态槽，不截短本次计算。
+- 空序列不读取 `ssm_state_indices/num_accepted_tokens`，speculative padding 不参与值校验，也不读写空序列的 state pool。
+- 传入 indices 时，ACLNN 第一阶段在 host 校验活跃 slot/accepted 及 speculative 容量，保存校验后的元数据快照供本次 executor 消费。非法值返回 `ACLNN_ERR_PARAM_INVALID`，消息包含请求、token、实际值及边界。设备元数据读取需要同步及 D2H，与已有 A5 CU 快照共享必要同步；无 indices 的调用不增加这项开销。使用 indices 的调用不支持 ACLGraph 捕获，修改元数据后须重建 executor。
 - `cu_seqlens` 可选；标准表示为空时为 rank4 BSND，按 batch 行划分；提供时为 rank3 packed TND；旧 shape 别名见第 4.1 节。提供时首项必须为 0，offset
   必须单调不减，末项为有效 token 数且不得超过输入
   token capacity；相邻差值为序列长度。A5 host 读取实际值选择 X，device kernel 仍检查边界。
@@ -225,7 +227,7 @@ recurrent_kda<<<blockDim, nullptr, stream>>>(
 | 条件 | 返回码/异常 |
 | --- | --- |
 | 必选 tensor、workspaceSize 或 executor 为空 | `ACLNN_ERR_PARAM_NULLPTR` |
-| rank/shape/dtype/layout 或属性组合非法 | `ACLNN_ERR_PARAM_INVALID` |
+| rank/shape/dtype/layout、活跃 slot/accepted 或属性组合非法（含启用 safe gate 时的 NaN lower_bound） | `ACLNN_ERR_PARAM_INVALID` |
 | 内部 tensor 创建或 L0 调用失败 | `ACLNN_ERR_INNER_NULLPTR` |
 | Python 输入不是 NPU tensor 或 runtime/op_api 未加载 | `RuntimeError` |
 
