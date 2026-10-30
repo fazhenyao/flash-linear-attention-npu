@@ -4563,8 +4563,10 @@ def npu_recurrent_kda(
 
     # A_log presence selects raw-gate mode; the legacy boolean is ignored.
     use_gate = A_log is not None
-    safe = _optional_bool(safe_gate, False)
-    lower = _optional_float(lower_bound, -5.0)
+    safe = use_gate and _optional_bool(safe_gate, False)
+    lower = _optional_float(lower_bound, -5.0) if safe else -5.0
+    if not use_gate:
+        dt_bias = None
     if use_gate:
         if A_log is None or A_log.dtype != torch.float32 or _shape(A_log) != (value_heads,):
             raise RuntimeError("npu_recurrent_kda: A_log must be FP32 [HV] when use_gate_in_kernel=True.")
@@ -4578,8 +4580,6 @@ def npu_recurrent_kda(
                 raise RuntimeError("npu_recurrent_kda: dt_bias must be FP32 [HV*K] or [HV,K].")
             if dt_bias.device != q.device:
                 raise RuntimeError("npu_recurrent_kda: dt_bias must be on the same device as q.")
-    elif safe or dt_bias is not None:
-        raise RuntimeError("npu_recurrent_kda: dt_bias and safe_gate require A_log to be passed.")
 
     out = _empty_like(v)
     final_state_work = initial_state_work if inplace else _empty(state_shape, initial_state_work)

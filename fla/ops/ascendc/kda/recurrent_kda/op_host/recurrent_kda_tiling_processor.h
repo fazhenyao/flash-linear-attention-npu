@@ -103,6 +103,7 @@ struct RecurrentKdaTilingContext {
     uint64_t aivNum = 0;
     uint64_t ubSize = 0;
     uint32_t isA5 = 0;
+    const void *cuSeqlensData = nullptr; // Host value dependency, never a device pointer.
 };
 
 class RecurrentKdaTilingProcessor {
@@ -286,9 +287,10 @@ private:
                         OP_LOGE(ctx_.nodeName, "%s batch stride calculation overflows.", name),
                         return ge::GRAPH_FAILED);
             const uint64_t expectedBatchStride = seqLen * tokenStride;
-            OP_CHECK_IF(tokenMajor && static_cast<uint64_t>(strides[RKDA_DIM_0]) != expectedBatchStride,
+            OP_CHECK_IF(tokenMajor && static_cast<uint64_t>(strides[RKDA_DIM_0]) <
+                                         expectedBatchStride - tokenStride + tokenMajorSpan,
                         OP_LOGE(ctx_.nodeName,
-                                "%s batch stride must equal T * token stride for flattened BSND, "
+                                "%s batch stride overlaps a BSND sequence, "
                                 "but got %llu and expected %llu.",
                                 name, static_cast<unsigned long long>(strides[RKDA_DIM_0]),
                                 static_cast<unsigned long long>(expectedBatchStride)),
@@ -426,9 +428,6 @@ private:
 
     ge::graphStatus CheckOptionalGateShapes(int64_t hvNum, int64_t kDim) const
     {
-        OP_CHECK_IF(ctx_.safeGate && !ctx_.hasALog,
-                    OP_LOGE(ctx_.nodeName, "safe_gate requires A_log to be passed."),
-                    return ge::GRAPH_FAILED);
         if (ctx_.hasALog) {
             if (!CheckDim(ctx_.aLogShape, RKDA_METADATA_RANK1, "A_log")) {
                 return ge::GRAPH_FAILED;
@@ -437,10 +436,7 @@ private:
                         OP_LOGE(ctx_.nodeName, "A_log shape must be [HV]."),
                         return ge::GRAPH_FAILED);
         }
-        if (ctx_.hasDtBias) {
-            OP_CHECK_IF(!ctx_.hasALog,
-                        OP_LOGE(ctx_.nodeName, "dt_bias requires A_log to be passed."),
-                        return ge::GRAPH_FAILED);
+        if (ctx_.hasALog && ctx_.hasDtBias) {
             size_t rank = ctx_.dtBiasShape.GetDimNum();
             bool valid = (rank == 1 && ctx_.dtBiasShape.GetDim(RKDA_DIM_0) == hvNum * kDim) ||
                          (rank == 2 && ctx_.dtBiasShape.GetDim(RKDA_DIM_0) == hvNum &&
@@ -595,6 +591,9 @@ private:
         tiling.keyHeadStride = static_cast<uint64_t>(keyStrides[headDim]);
         tiling.valueTokenStride = static_cast<uint64_t>(valueStrides[tokenDim]);
         tiling.valueHeadStride = static_cast<uint64_t>(valueStrides[headDim]);
+        tiling.queryBatchStride = ctx_.hasCuSeqlens ? 0 : static_cast<uint64_t>(queryStrides[0]);
+        tiling.keyBatchStride = ctx_.hasCuSeqlens ? 0 : static_cast<uint64_t>(keyStrides[0]);
+        tiling.valueBatchStride = ctx_.hasCuSeqlens ? 0 : static_cast<uint64_t>(valueStrides[0]);
         const auto stateInStrides = ResolveStateStrides(false);
         const auto stateOutStrides = ResolveStateStrides(true);
         tiling.stateInStride0 = static_cast<uint64_t>(stateInStrides[RKDA_DIM_0]);
@@ -611,13 +610,13 @@ private:
         tiling.hasCuSeqlens = ctx_.hasCuSeqlens;
         tiling.hasSsmStateIndices = ctx_.hasSsmStateIndices;
         tiling.hasALog = ctx_.hasALog;
-        tiling.hasDtBias = ctx_.hasDtBias;
+        tiling.hasDtBias = ctx_.hasALog && ctx_.hasDtBias;
         tiling.hasAcceptedTokens = ctx_.hasAcceptedTokens;
         tiling.useQkL2norm = ctx_.useQkL2norm;
         tiling.useGateInKernel = ctx_.useGateInKernel;
         tiling.useBetaSigmoid = ctx_.useBetaSigmoid;
         tiling.allowNegEigval = ctx_.allowNegEigval;
-        tiling.safeGate = ctx_.safeGate;
+        tiling.safeGate = ctx_.hasALog && ctx_.safeGate;
         tiling.stateVFirst = ctx_.stateVFirst;
         tiling.outputFinalState = ctx_.outputFinalState;
         tiling.inplaceFinalState = ctx_.inplaceFinalState;
@@ -719,14 +718,41 @@ private:
     {
         // 3 full FP32 banks + raw input/output double slots + parameter slots + guard.
         const uint64_t capacity = std::min<uint64_t>(ctx_.ubSize, 248ULL * 1024);
+        uint64_t maxLength = tiling.seqLen;
+        if (ctx_.hasCuSeqlens) {
+            OP_CHECK_IF(ctx_.cuSeqlensData == nullptr,
+                        OP_LOGE(ctx_.nodeName, "A5 X selection requires host cu_seqlens values."),
+                        return ge::GRAPH_FAILED);
+            auto value = [&](uint32_t i) -> int64_t {
+                return ctx_.cuSeqlensDtype == ge::DT_INT32 ?
+                    static_cast<const int32_t *>(ctx_.cuSeqlensData)[i] :
+                    static_cast<const int64_t *>(ctx_.cuSeqlensData)[i];
+            };
+            int64_t previous = value(0);
+            OP_CHECK_IF(previous != 0, OP_LOGE(ctx_.nodeName, "cu_seqlens must start at zero."),
+                        return ge::GRAPH_FAILED);
+            maxLength = 0;
+            for (uint32_t b = 0; b < tiling.b; ++b) {
+                const int64_t end = value(b + 1);
+                OP_CHECK_IF(end < previous || end > tiling.t,
+                            OP_LOGE(ctx_.nodeName, "cu_seqlens must be monotonic within token capacity."),
+                            return ge::GRAPH_FAILED);
+                maxLength = std::max<uint64_t>(maxLength, static_cast<uint64_t>(end - previous));
+                previous = end;
+            }
+        }
+        const uint64_t selectionLength = std::min<uint64_t>(8, std::max<uint64_t>(1, maxLength));
         uint64_t selected = 0, bytes = 0;
         // Beta rows are padded to one 32-byte slot per token and double-buffered.
         // X=8 is the largest A5 tile that fits with the three state banks.
         for (uint64_t x : {1ULL, 2ULL, 4ULL, 8ULL}) {
             const uint64_t betaSlot = std::max<uint64_t>(128, 32 * x);
             const uint64_t beta = 2 * betaSlot;
-            const uint64_t peak = 199744 + 3072 * x + beta;
-            if (x > tiling.seqLen || 32 * x > betaSlot || peak > capacity) continue;
+            // K-first FP32: three 128x136 banks instead of 128x128.
+            // BF16 padding fits in the existing 64 KiB bank allocation.
+            const uint64_t statePadding = !ctx_.stateVFirst && ctx_.stateDtype == ge::DT_FLOAT ? 12288 : 0;
+            const uint64_t peak = 199744 + statePadding + 3072 * x + beta;
+            if (x > selectionLength || 32 * x > betaSlot || peak > capacity) continue;
             selected = x;
             bytes = peak;
         }

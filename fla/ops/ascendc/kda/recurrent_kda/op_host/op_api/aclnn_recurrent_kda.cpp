@@ -11,6 +11,7 @@
  * \file aclnn_recurrent_kda.cpp
  * \brief
  */
+#include "op_common/log/log.h"
 #include "aclnn_recurrent_kda.h"
 #include "recurrent_kda.h"
 
@@ -20,11 +21,14 @@
 #include "opdev/op_dfx.h"
 #include "opdev/op_executor.h"
 #include "opdev/op_log.h"
+#include "opdev/platform.h"
 #include "opdev/tensor_view_utils.h"
+#include "acl/acl_rt.h"
 
 #include <cstring>
 #include <algorithm>
 #include <limits>
+#include <vector>
 
 using namespace op;
 
@@ -178,11 +182,11 @@ bool IsSupportedQkvView(const aclTensor *tensor, RecurrentKdaLayout layout)
         return false;
     }
 
-    // The kernel flattens BSND batches only for token-major storage.  A
-    // legal BSND head-major view is materialized by ACLNN instead.
+    // Each sequence is a DMA segment with its independent physical batch base.
     if (layout == RecurrentKdaLayout::BSND && Dim(tensor, DIM0) > 1) {
         const int64_t seqLen = Dim(tensor, DIM1);
-        if (!tokenMajor || tokenStride > maxInt64 / seqLen || strides[DIM0] != seqLen * tokenStride) {
+        if (!tokenMajor || tokenStride > maxInt64 / seqLen ||
+            strides[DIM0] < (seqLen - 1) * tokenStride + tokenMajorSpan) {
             return false;
         }
     }
@@ -362,11 +366,6 @@ bool CheckShape(const RecurrentKdaParams &params, bool varlen)
     // Gate mode is determined solely by A_log presence.  The legacy
     // use_gate_in_kernel attribute is retained for ABI compatibility and is
     // intentionally ignored by the numeric path.
-    if (params.aLogOptional == nullptr && (params.safeGate || params.dtBiasOptional != nullptr)) {
-        OP_LOGE(ACLNN_ERR_PARAM_INVALID,
-                "npu_recurrent_kda: dt_bias and safe_gate require A_log to be passed.");
-        return false;
-    }
     if (params.aLogOptional != nullptr && (Rank(params.aLogOptional) != 1 || Dim(params.aLogOptional, DIM0) != hv)) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "npu_recurrent_kda: A_log must be float32 with shape [HV].");
         return false;
@@ -486,6 +485,50 @@ void SetInputOriginalShape(RecurrentKdaParams &params)
     SetTensorOriginalShape(params.numAcceptedTokensOptional);
 }
 
+// The public ABI accepts a device Tensor, whereas value-dependent tiling needs
+// host data. Workspace creation has no stream argument: synchronize before D2H,
+// then give the executor an owned host constant (also copied to GM for kernel use).
+aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *executor)
+{
+    const auto *cu = params.cuSeqlensOptional;
+    if (cu == nullptr || GetCurrentPlatformInfo().GetSocVersion() != SocVersion::ASCEND950)
+        return ACLNN_SUCCESS;
+    const int64_t count = cu->GetViewShape().GetDim(0);
+    const int64_t stride = cu->GetViewStrides()[0];
+    const uint64_t width = cu->GetDataType() == DataType::DT_INT32 ? 4 : 8;
+    const int64_t offset = cu->GetViewOffset();
+    const uint64_t maxElements = std::numeric_limits<uint64_t>::max() / width;
+    if (stride < 0 || offset < 0 || uint64_t(offset) >= maxElements ||
+        uint64_t(count - 1) > (maxElements - uint64_t(offset) - 1) / std::max<int64_t>(stride, 1)) {
+        OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON("aclnnRecurrentKda", "cu_seqlens",
+            "nonnegative stride/offset and representable storage span required; count=" +
+            std::to_string(count) + ", stride=" + std::to_string(stride) + ", offset=" + std::to_string(offset));
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    const uint64_t bytes = (uint64_t(count - 1) * uint64_t(stride) + 1) * width;
+    std::vector<uint8_t> storage(bytes);
+    // GetData resolves both storage and view offsets; GetStorageAddr alone can
+    // point before the logical view after the executor binds its storage.
+    const auto *source = static_cast<const uint8_t *>(cu->GetData());
+    if (gert::TensorPlacementUtils::IsOnHost(cu->GetPlacement())) {
+        std::memcpy(storage.data(), source, bytes);
+    } else {
+        auto ret = aclrtSynchronizeDevice();
+        CHECK_COND(ret == ACL_SUCCESS, ACLNN_ERR_RUNTIME_ERROR,
+                   "cu_seqlens host value dependency requires device synchronization; runtime status=%d.", ret);
+        ret = aclrtMemcpy(storage.data(), bytes, source, bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+        CHECK_COND(ret == ACL_SUCCESS, ACLNN_ERR_RUNTIME_ERROR,
+                   "cu_seqlens device-to-host copy failed; bytes=%lu, runtime status=%d.", bytes, ret);
+    }
+    auto *host = executor->AllocHostTensor(cu->GetViewShape(), cu->GetDataType());
+    CHECK_RET(host != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    auto *destination = static_cast<uint8_t *>(host->GetData());
+    for (int64_t i = 0; i < count; ++i)
+        std::memcpy(destination + i * width, storage.data() + uint64_t(i) * stride * width, width);
+    params.cuSeqlensOptional = host;
+    return ACLNN_SUCCESS;
+}
+
 aclnnStatus PreProcess(
     RecurrentKdaParams &params,
     bool queryNeedsContiguous,
@@ -544,7 +587,14 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     uint64_t *workspaceSize,
     aclOpExecutor **executor)
 {
-    L2_DFX_PHASE_1(aclnnRecurrentKda,
+    // Device tensor descriptors do not include their values in the L2 cache
+    // key. Packed A5 tiling depends on those values and owns a host snapshot,
+    // so this path must rebuild instead of returning a cached executor.
+    if (CheckPhase1Params(executor, workspaceSize) != ACLNN_SUCCESS)
+        return ACLNN_ERR_PARAM_NULLPTR;
+    const bool valueDependent = cuSeqlensOptional != nullptr &&
+        GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND950;
+    L2_DFX_PHASE_1_WITHOUT_CACHE(aclnnRecurrentKda,
                    DFX_IN(query, key, value, gate, beta, initialStateRef, cuSeqlensOptional,
                           ssmStateIndicesOptional, aLogOptional, dtBiasOptional, numAcceptedTokensOptional,
                           layout, scale, outputFinalState, inplaceFinalState, useQkL2normInKernel,
@@ -552,9 +602,19 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
                           stateVFirst),
                    DFX_OUT(initialStateRef, attnOut, finalState));
 
+    if (!valueDependent && op::internal::GetFromCache(executor, workspaceSize, "aclnnRecurrentKda",
+            DFX_IN(query, key, value, gate, beta, initialStateRef, cuSeqlensOptional,
+                   ssmStateIndicesOptional, aLogOptional, dtBiasOptional, numAcceptedTokensOptional,
+                   layout, scale, outputFinalState, inplaceFinalState, useQkL2normInKernel,
+                   useGateInKernel, useBetaSigmoidInKernel, allowNegEigval, safeGate, lowerBound, stateVFirst),
+            DFX_OUT(initialStateRef, attnOut, finalState))) {
+        return ACLNN_SUCCESS;
+    }
+
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
     auto executorPtr = uniqueExecutor.get();
+    if (valueDependent) executorPtr->AbandonCache();
 
     RecurrentKdaParams params{query, key, value, gate, beta, initialStateRef, cuSeqlensOptional,
                               ssmStateIndicesOptional, aLogOptional, dtBiasOptional,
@@ -562,6 +622,12 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
                               useQkL2normInKernel, useGateInKernel, useBetaSigmoidInKernel,
                               allowNegEigval, safeGate, lowerBound, stateVFirst, attnOut, finalState};
 
+    // Ignore inactive raw-gate inputs before validation or materialization.
+    if (params.aLogOptional == nullptr) {
+        params.dtBiasOptional = nullptr;
+        params.safeGate = false;
+        params.lowerBound = -5.0;
+    }
     CHECK_RET(CheckNotNull(params), ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckDtypeValid(params), ACLNN_ERR_PARAM_INVALID);
     // `cu_seqlens` is the only mode discriminator.  `layout` remains a
@@ -582,6 +648,8 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     const bool queryNeedsContiguous = !querySupportsDirect;
     const bool keyNeedsContiguous = !keySupportsDirect;
     const bool valueNeedsContiguous = !valueSupportsDirect;
+    const auto cuStatus = MaterializeCuSeqlens(params, executorPtr);
+    if (cuStatus != ACLNN_SUCCESS) return cuStatus;
     CHECK_RET(PreProcess(params, queryNeedsContiguous, keyNeedsContiguous, valueNeedsContiguous, executorPtr) ==
                   ACLNN_SUCCESS,
               ACLNN_ERR_PARAM_INVALID);

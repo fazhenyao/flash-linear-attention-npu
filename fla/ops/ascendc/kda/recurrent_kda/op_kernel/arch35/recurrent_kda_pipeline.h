@@ -28,10 +28,11 @@ struct RKDAInitParams {
     GM_ADDR finalState;
 };
 
-template <typename inType, typename outType, typename stateType>
+template <typename inType, typename outType, typename stateType, bool stateVFirst = true>
 class RKDA {
     static constexpr uint16_t D = RegBase::DIM;
-    static constexpr uint32_t BANK = RegBase::STATE_BYTES;
+    using StateLayout = RegBase::StateLayout<stateType, stateVFirst>;
+    static constexpr uint32_t BANK = StateLayout::BYTES;
     static constexpr uint64_t INVALID = static_cast<uint64_t>(-1);
 public:
     __aicore__ explicit RKDA(const RecurrentKdaTilingData *tiling) : td_(tiling) {}
@@ -42,7 +43,7 @@ public:
         x_ = td_->windowSize;
         betaSlot_ = 32 * x_;
         if (betaSlot_ < 128) betaSlot_ = 128;
-        // Exact order and sizes from the protected plan, section 2.4.
+        // Keep V-first offsets unchanged; K-first FP32 banks include row padding.
         qOffset_ = 3 * BANK;
         kOffset_ = qOffset_ + 512 * x_;
         vOffset_ = kOffset_ + 512 * x_;
@@ -81,7 +82,7 @@ public:
         bool valid = true;
         Task current{}, next{};
         bool active = PrepareTask(cursor, current, valid);
-        uint32_t initialBank = 0, parameterSlot = 0;
+        uint32_t initialBank = 0, parameterSlot = 0, inputSlot = 0;
         bool prefetched = false;
         while (active) {
             const bool hasNext = PrepareTask(cursor, next, valid);
@@ -89,9 +90,9 @@ public:
                 if (prefetched) WaitFlag<HardEvent::MTE2_V>(EVENT_ID1);
                 return;
             }
-            initialBank_ = initialBank;
-            alternateBank_ = (initialBank + 1) % 3;
-            RunTask(current, hasNext ? &next : nullptr, prefetched, parameterSlot, initialBank);
+            BeginBanks(initialBank);
+            RunTask(current, hasNext ? &next : nullptr, prefetched, parameterSlot, initialBank, inputSlot);
+            ReleaseBanks();
             if (!hasNext) break;
             current = next;
             parameterSlot ^= 1;
@@ -100,6 +101,39 @@ public:
     }
 
 private:
+    enum BankUse : uint32_t { FREE = 0, RECURRENCE = 1, PREFETCHED = 2, MTE3_SOURCE = 4 };
+    static constexpr uint32_t NO_BANK = 3;
+
+    __aicore__ inline uint32_t FreeBank() const
+    {
+        for (uint32_t bank = 0; bank < 3; ++bank)
+            if (bankUse_[bank] == FREE) return bank;
+        return NO_BANK;
+    }
+
+    __aicore__ inline void BeginBanks(uint32_t initial)
+    {
+        // A prefetched initial State stays reserved until its task takes ownership.
+        initialBank_ = initial;
+        bankUse_[initialBank_] = RECURRENCE;
+        alternateBank_ = FreeBank();
+        bankUse_[alternateBank_] = RECURRENCE;
+    }
+
+    __aicore__ inline void ReleaseBanks()
+    {
+        bankUse_[initialBank_] &= ~RECURRENCE;
+        bankUse_[alternateBank_] &= ~RECURRENCE;
+    }
+
+    __aicore__ inline void ReleaseStateDma()
+    {
+        if (pendingStateBank_ != NO_BANK) {
+            bankUse_[pendingStateBank_] &= ~MTE3_SOURCE;
+            pendingStateBank_ = NO_BANK;
+        }
+    }
+
     struct Task {
         uint64_t id, request, head;
         int64_t begin, end;
@@ -116,9 +150,9 @@ private:
         if (!active || !valid) return;
         bool hasNext = PrepareTask(cursor, next, valid), hasFollowing = false;
         if (!valid) return;
-        uint32_t initial = 0, alternate = 1, parameterSlot = 0, inputSlot = 0;
+        uint32_t initial = 0, parameterSlot = 0, inputSlot = 0;
         // The output State row shape is invariant across all tasks on this core.
-        const DataCopyExtParams stateCopy{D, D * sizeof(stateType), 0,
+        const DataCopyExtParams stateCopy{D, D * sizeof(stateType), StateLayout::ROW_GAP,
             static_cast<uint32_t>((td_->stateOutStride2 - D) * sizeof(stateType)), 0};
 #ifdef RKDA_EXECUTION_TRACE
         auto events = (__ubuf__ volatile uint32_t *)ub_[eventOffset_].GetPhyAddr();
@@ -130,8 +164,7 @@ private:
                 if (pending) WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
                 return;
             }
-            initialBank_ = initial;
-            alternateBank_ = alternate;
+            BeginBanks(initial);
             RunFinalStateTask(current, hasNext ? &next : nullptr, prefetched,
                               parameterSlot, inputSlot, pending, cursor, following, hasFollowing, valid, stateCopy);
             if (!valid) {
@@ -139,11 +172,9 @@ private:
                 if (pending) WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
                 return;
             }
+            ReleaseBanks();
             if (!hasNext) break;
-            const uint32_t finalBank = ((current.end - current.begin) & 1) ? alternate : initial;
-            const uint32_t nextInitial = 3 - initial - alternate;
-            alternate = 3 - finalBank - nextInitial;
-            initial = nextInitial;
+            initial = prefetchedBank_;
             current = next;
             next = following;
             hasNext = hasFollowing;
@@ -165,7 +196,6 @@ private:
     {
         const int64_t begin = current.begin, end = current.end;
         const uint64_t head = current.head, task = current.id;
-        const uint32_t spareBank = 3 - initialBank_ - alternateBank_;
         const uint32_t finalBank = ((end - begin) & 1) ? alternateBank_ : initialBank_;
         const bool writeState = td_->inplaceFinalState || td_->outputFinalState;
         const uint64_t stateOffset = current.request * td_->stateOutStride0 + head * td_->stateOutStride1;
@@ -182,7 +212,7 @@ private:
             Prefetch(begin, ValidTokens(begin, end), head, slot);
         }
         // The spare bank can still be read by the previous task's final DMA.
-        bool deferStatePrefetch = nextTask && pending;
+        bool deferStatePrefetch = nextTask && FreeBank() == NO_BANK;
         for (int64_t tile = begin; tile < end; tile += x_, slot ^= 1) {
             const uint32_t valid = ValidTokens(tile, end), base = uint32_t(tile - begin);
             const bool lastTile = tile + valid == end;
@@ -190,6 +220,9 @@ private:
             WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
             SetFlag<HardEvent::S_V>(EVENT_ID0);
             WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            Trace(1, task, base, slot);
+            Dispatch(base, valid, slot, parameter, lastTile);
+            // Enqueue future inputs while the current slot is consumed by VF.
             if (!lastTile) {
                 Prefetch(tile + valid, ValidTokens(tile + valid, end), head, slot ^ 1);
             } else if (nextTask) {
@@ -197,9 +230,7 @@ private:
                 Trace(9, nextTask->id, 0, slot ^ 1);
             }
             if (nextTask && base == 0 && !deferStatePrefetch)
-                PrefetchNext(*nextTask, parameterSlot, spareBank);
-            Trace(1, task, base, slot);
-            Dispatch(base, valid, slot, parameter, lastTile);
+                PrefetchNext(*nextTask, parameterSlot, FreeBank());
             if (base == 0 && nextTask)
                 hasFollowing = PrepareTask(cursor, following, validTask);
             // The old batch belongs to the opposite out slot. Reclaim it while
@@ -207,10 +238,11 @@ private:
             if (pending) {
                 WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
                 pending = false;
+                ReleaseStateDma();
                 Trace(10, task, base, slot ^ 1);
             }
             if (deferStatePrefetch) {
-                PrefetchNext(*nextTask, parameterSlot, spareBank);
+                PrefetchNext(*nextTask, parameterSlot, FreeBank());
                 deferStatePrefetch = false;
             }
             SetFlag<HardEvent::V_S>(EVENT_ID0);
@@ -219,8 +251,11 @@ private:
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
             WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
             CopyOutputTile(tile, valid, head, slot);
-            if (lastTile && writeState)
+            if (lastTile && writeState) {
                 DataCopyPad(stateOut_[stateOffset], ub_[finalBank * BANK].template ReinterpretCast<stateType>(), stateCopy);
+                bankUse_[finalBank] |= MTE3_SOURCE;
+                pendingStateBank_ = finalBank;
+            }
             SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
             pending = true;
             Trace(11, task, base + valid, slot);
@@ -300,11 +335,12 @@ private:
 
     template <class T>
     __aicore__ inline void CopyRows(GlobalTensor<T> &gm, uint64_t offset, uint64_t stride,
-                                    uint32_t destination, uint32_t width, uint32_t rows)
+                                    uint32_t destination, uint32_t width, uint32_t rows,
+                                    uint32_t rowGap = 0)
     {
         auto local = ub_[destination].template ReinterpretCast<T>();
         DataCopyExtParams copy{static_cast<uint16_t>(rows), static_cast<uint32_t>(width * sizeof(T)),
-                               static_cast<uint32_t>((stride - width) * sizeof(T)), 0, 0};
+                               static_cast<uint32_t>((stride - width) * sizeof(T)), rowGap, 0};
         DataCopyPadExtParams<T> pad{false, 0, 0, 0};
         DataCopyPad(local, gm[offset], copy, pad);
     }
@@ -325,14 +361,21 @@ private:
         }
     }
 
+    __aicore__ inline uint64_t InputOffset(uint64_t token, uint64_t tokenStride,
+                                         uint64_t batchStride) const
+    {
+        if (td_->hasCuSeqlens) return token * tokenStride;
+        return (token / td_->seqLen) * batchStride + (token % td_->seqLen) * tokenStride;
+    }
+
     __aicore__ inline void Prefetch(int64_t token, uint32_t rows, uint64_t head, uint32_t slot)
     {
         const uint64_t hk = head / (td_->nv / td_->nk);
-        CopyRows(q_, uint64_t(token) * td_->queryTokenStride + hk * td_->queryHeadStride,
+        CopyRows(q_, InputOffset(uint64_t(token), td_->queryTokenStride, td_->queryBatchStride) + hk * td_->queryHeadStride,
                  td_->queryTokenStride, qOffset_ + slot * 256 * x_, D, rows);
-        CopyRows(k_, uint64_t(token) * td_->keyTokenStride + hk * td_->keyHeadStride,
+        CopyRows(k_, InputOffset(uint64_t(token), td_->keyTokenStride, td_->keyBatchStride) + hk * td_->keyHeadStride,
                  td_->keyTokenStride, kOffset_ + slot * 256 * x_, D, rows);
-        CopyRows(v_, uint64_t(token) * td_->valueTokenStride + head * td_->valueHeadStride,
+        CopyRows(v_, InputOffset(uint64_t(token), td_->valueTokenStride, td_->valueBatchStride) + head * td_->valueHeadStride,
                  td_->valueTokenStride, vOffset_ + slot * 256 * x_, D, rows);
 #if defined(DTYPE_GATE) && defined(DTYPE_BETA)
         // The OPP binary's input types also determine the DMA width and strides.
@@ -365,6 +408,7 @@ private:
     __aicore__ inline void Complete(uint32_t count, uint64_t task)
     {
         WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        ReleaseStateDma();
         auto events = (__ubuf__ volatile uint32_t *)ub_[eventOffset_].GetPhyAddr();
         events[8] = count;
         Trace(4, task, count, 0);
@@ -377,7 +421,7 @@ private:
             initialToken += Metadata(args_.numAcceptedTokens, td_->acceptedTokensDtype, task.request) - 1;
         const uint64_t initial = Slot(task.request, task.begin, initialToken);
         CopyRows(stateIn_, initial * td_->stateInStride0 + task.head * td_->stateInStride1,
-                 td_->stateInStride2, bank * BANK, D, D);
+                 td_->stateInStride2, bank * BANK, D, D, StateLayout::ROW_GAP);
         const uint32_t parameter = paramOffset_ + parameterSlot * 544;
         if (td_->hasALog) {
             CopyRows(aLog_, task.head, 1, parameter, 1, 1);
@@ -387,13 +431,15 @@ private:
 
     __aicore__ inline void PrefetchNext(const Task &next, uint32_t parameterSlot, uint32_t bank)
     {
+        bankUse_[bank] = PREFETCHED;
+        prefetchedBank_ = bank;
         PrefetchTask(next, bank, parameterSlot ^ 1);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID1);
         Trace(7, next.id, 0, bank);
     }
 
     __aicore__ inline void RunTask(const Task &current, const Task *nextTask, bool prefetched,
-                                  uint32_t parameterSlot, uint32_t &nextInitialBank)
+                                  uint32_t parameterSlot, uint32_t &nextInitialBank, uint32_t &slot)
     {
         const uint64_t task = current.id, request = current.request, head = current.head;
         const int64_t begin = current.begin, end = current.end;
@@ -408,11 +454,11 @@ private:
             PrefetchTask(current, initialBank_, parameterSlot);
         }
         const uint32_t parameter = paramOffset_ + parameterSlot * 544;
-        Prefetch(begin, ValidTokens(begin, end), head, 0);
-        uint32_t pending = 0, slot = 0;
+        if (!prefetched) Prefetch(begin, ValidTokens(begin, end), head, slot);
+        uint32_t pending = 0;
         bool pendingOut = false;
         const bool writeState = td_->inplaceFinalState || td_->outputFinalState;
-        const DataCopyExtParams stateCopy{D, D * sizeof(stateType), 0,
+        const DataCopyExtParams stateCopy{D, D * sizeof(stateType), StateLayout::ROW_GAP,
             static_cast<uint32_t>((td_->stateOutStride2 - D) * sizeof(stateType)), 0};
         for (int64_t tile = begin; tile < end; tile += x_, slot ^= 1) {
             const uint32_t valid = ValidTokens(tile, end), base = uint32_t(tile - begin);
@@ -420,16 +466,21 @@ private:
             WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
             SetFlag<HardEvent::S_V>(EVENT_ID0);
             WaitFlag<HardEvent::S_V>(EVENT_ID0);
-            if (tile + valid < end)
-                Prefetch(tile + valid, ValidTokens(tile + valid, end), head, slot ^ 1);
             const bool lastTile = tile + valid == end;
-            // Two banks alternate throughout this task; the third belongs to the next task.
-            if (nextTask && base == 0) {
-                nextInitialBank = (initialBank_ + 2) % 3;
-                PrefetchNext(*nextTask, parameterSlot, nextInitialBank);
-            }
             Trace(1, task, base, slot);
             Dispatch(base, valid, slot, parameter, lastTile);
+            // Only the opposite input slot and a free State bank are prefetched.
+            if (!lastTile) {
+                Prefetch(tile + valid, ValidTokens(tile + valid, end), head, slot ^ 1);
+            } else if (nextTask) {
+                Prefetch(nextTask->begin, ValidTokens(nextTask->begin, nextTask->end), nextTask->head, slot ^ 1);
+                Trace(9, nextTask->id, 0, slot ^ 1);
+            }
+            // Two banks alternate throughout this task; the third belongs to the next task.
+            if (nextTask && base == 0) {
+                nextInitialBank = FreeBank();
+                PrefetchNext(*nextTask, parameterSlot, nextInitialBank);
+            }
             // State snapshots remain token-granular: the VF can need a bank
             // released before it can finish the tile. Out has its own event.
             for (uint32_t t = 0; writeState && t < valid; ++t) {
@@ -442,10 +493,12 @@ private:
                 SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
                 WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
                 {
-                    uint32_t bank = (initialBank_ + ((token + 1) & 1)) % 3;
+                    uint32_t bank = ((token + 1) & 1) ? alternateBank_ : initialBank_;
                     const uint64_t destination = Slot(request, begin, tile + t) * td_->stateOutStride0 +
                                                  head * td_->stateOutStride1;
                     DataCopyPad(stateOut_[destination], ub_[bank * BANK].template ReinterpretCast<stateType>(), stateCopy);
+                    bankUse_[bank] |= MTE3_SOURCE;
+                    pendingStateBank_ = bank;
                 }
                 SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
                 pending = count;
@@ -488,13 +541,23 @@ private:
     __aicore__ inline void DispatchLayout(uint32_t base, uint32_t valid, uint32_t slot,
                                          uint32_t parameter, bool last)
     {
-        if (td_->stateVFirst) {
+        if constexpr (stateVFirst) {
+            if (x_ == 1) {
+                if (td_->useQkL2norm && td_->hasALog && td_->hasDtBias && td_->useBetaSigmoid &&
+                    !td_->allowNegEigval && !td_->safeGate && !td_->hasSsmStateIndices) {
+                    Tile<Gate, Beta, true, true, 0, false>(base, valid, slot, parameter, last);
+                } else Tile<Gate, Beta, true, false, 0, false>(base, valid, slot, parameter, last);
+                return;
+            }
             // Specialize the common fused recurrence to retire runtime flags
             // before the VF's State/out row loops. All other flags use the generic VF.
             if (td_->useQkL2norm && td_->hasALog && td_->hasDtBias && td_->useBetaSigmoid &&
                 !td_->allowNegEigval && !td_->safeGate && !td_->hasSsmStateIndices) {
-                if (x_ == 4) Tile<Gate, Beta, true, true, 4>(base, valid, slot, parameter, last);
+                if (x_ == 4 && valid == 4) Tile<Gate, Beta, true, true, 4>(base, valid, slot, parameter, last);
+                else if (x_ == 8 && valid == 8) Tile<Gate, Beta, true, true, 8>(base, valid, slot, parameter, last);
                 else Tile<Gate, Beta, true, true>(base, valid, slot, parameter, last);
+            } else if (x_ == 8 && valid == 8) {
+                Tile<Gate, Beta, true, false, 8>(base, valid, slot, parameter, last);
             } else Tile<Gate, Beta, true>(base, valid, slot, parameter, last);
         } else Tile<Gate, Beta, false>(base, valid, slot, parameter, last);
     }
@@ -513,7 +576,8 @@ private:
 #endif
     }
 
-    template <class Gate, class Beta, bool vFirst, bool fused = false, uint32_t fixedWindow = 0>
+    template <class Gate, class Beta, bool vFirst, bool fused = false, uint32_t fixedWindow = 0,
+              bool twoPass = true>
     __aicore__ inline void Tile(uint32_t base, uint32_t valid, uint32_t slot,
                                 uint32_t parameter, bool last)
     {
@@ -527,8 +591,8 @@ private:
         auto capturedParams = (__ubuf__ float *)(memory + parameter);
         auto capturedEvents = (__ubuf__ volatile uint32_t *)(memory + eventOffset_);
         const uint32_t bankSlot = initialBank_ | (alternateBank_ << 2) | (slot << 4);
-        // X=8 fits in the launch descriptor's valid-count field; the UB byte offset
-        // remains encoded in the upper 24 bits.
+        // The three-bit field encodes 8 as zero for the fixed X=8 path.
+        // General paths keep the runtime valid count unchanged.
         const uint32_t launch = bankSlot | (valid << 5) | (parameter << 8);
         const bool norm = fused || td_->useQkL2norm, rawGate = fused || td_->hasALog;
         const bool bias = fused || td_->hasDtBias;
@@ -542,9 +606,11 @@ private:
             const uint32_t config = fixedWindow ? launch : bankSlot;
             const uint32_t initialBank = config & 3, alternateBank = (config >> 2) & 3;
             const uint32_t inputSlot = (config >> 4) & 1;
-            const uint16_t count = fixedWindow ? ((config >> 5) & 7) : tokenCount;
+            const uint16_t encodedCount = static_cast<uint16_t>((config >> 5) & 7);
+            const uint16_t count = fixedWindow ?
+                static_cast<uint16_t>(encodedCount == 0 ? fixedWindow : encodedCount) : tokenCount;
             // Fixed-window specialization leaves general strides/dtypes on the original path.
-            constexpr uint32_t betaStride = 128;
+            constexpr uint32_t betaStride = fixedWindow < 4 ? 128 : 32 * fixedWindow;
             const uint32_t rowSlot = inputSlot * 256 * fixedWindow;
             constexpr uint32_t betaOffset = 3 * BANK + 2560 * fixedWindow;
             constexpr uint32_t outputOffset = betaOffset + 2 * betaStride + 1088;
@@ -554,23 +620,25 @@ private:
             auto gate = fixedWindow ? (__ubuf__ Gate *)(memory + 3 * BANK + 1536 * fixedWindow + 2 * rowSlot) : capturedGate;
             auto beta = fixedWindow ? (__ubuf__ Beta *)(memory + betaOffset + inputSlot * betaStride) : capturedBeta;
             auto output = fixedWindow ? (__ubuf__ outType *)(memory + outputOffset + rowSlot) : capturedOutput;
-            auto params = fixedWindow ? (__ubuf__ float *)(memory + (config >> 8)) : capturedParams;
+            // parameter slots are 544 bytes apart and the second slot is not
+            // 256-byte aligned; keep the captured pointer instead of packing
+            // its low address bits into the launch word.
+            auto params = capturedParams;
             auto events = fixedWindow ? (__ubuf__ volatile uint32_t *)(memory + outputOffset + 512 * fixedWindow) : capturedEvents;
             MaskReg mask = CreateMask<float, MaskPattern::ALL>();
             RegTensor<float> q0, q1, k0, k1, alpha0, alpha1, strength, a;
             RegTensor<float> temporary;
-            RegTensor<uint32_t> columns, pairColumns;
-            MaskReg firstFour;
-            if constexpr (vFirst) {
-                Arange((RegTensor<int32_t> &)columns, 4);
-                // Register Gather wraps indices modulo LANES, giving a four-lane rotation.
-                uint32_t count = 4;
-                firstFour = UpdateMask<float>(count);
-            } else {
+            RegTensor<uint32_t> outputRotation, columns, pairColumns, lowHalfMask;
+            Arange((RegTensor<int32_t> &)outputRotation, 4);
+            uint32_t firstCount = 4;
+            MaskReg firstFour = UpdateMask<float>(firstCount);
+            if constexpr (!vFirst) {
                 Arange((RegTensor<int32_t> &)columns, 0);
-                Muls(columns, columns, D, mask);
-                if constexpr (!std::is_same<stateType, float>::value)
+                Muls(columns, columns, StateLayout::PITCH, mask);
+                if constexpr (!std::is_same<stateType, float>::value) {
                     ShiftRights(pairColumns, columns, int16_t(1), mask);
+                    Duplicate(lowHalfMask, uint32_t(0xFFFF));
+                }
             }
             // Per-head parameters are loaded once per tile and kept in registers.
             if (rawGate) {
@@ -601,6 +669,11 @@ private:
                     RegBase::Sigmoid(strength, mask);
                     if (negative) Muls(strength, strength, 2.0f, mask);
                 }
+                RegTensor<float> updateKey0, updateKey1;
+                if constexpr (vFirst || !std::is_same<stateType, float>::value) {
+                    Mul(updateKey0, k0, strength, mask);
+                    Mul(updateKey1, k1, strength, mask);
+                }
                 RegBase::Load(alpha0, gate + t * D, mask);
                 RegBase::Load(alpha1, gate + t * D + 64, mask);
                 if (rawGate && bias) {
@@ -609,36 +682,78 @@ private:
                 }
                 RegBase::Decay(alpha0, a, rawGate, safe, lower, mask);
                 RegBase::Decay(alpha1, a, rawGate, safe, lower, mask);
-                // Expand only V-first to four rows; keep K-first on its R2 path.
-                if constexpr (vFirst) {
-                    RegTensor<float> outLo;
-                    Duplicate(outLo, 0.0f);
-                    // Two half loops avoid selecting an accumulator on every block.
-                    // Both halves stay FP32 in registers until the full token is ready.
+                // Batch the exact BF16->FP32 conversion once per token. The
+                // scratch lies in the reserved tail, beyond both event words;
+                // only this VF uses it, after all rows of the prior token retire.
+                RegTensor<float> valueLo, valueHi, outLo, outHi;
+                RegBase::Load(valueLo, value + t * D, mask);
+                RegBase::Load(valueHi, value + t * D + RegBase::LANES, mask);
+                if constexpr (!vFirst) {
+                    RegBase::UpdateKFirstColumns(destination, source, valueLo, valueHi,
+                        outLo, outHi, q0, q1, k0, k1, alpha0, alpha1, strength,
+                        (__ubuf__ float *)(events + 64), mask);
+                } else if constexpr (twoPass) {
+                    RegTensor<float> predictionLo, predictionHi, predictionKey0, predictionKey1;
+                    Mul(predictionKey0, alpha0, k0, mask);
+                    Mul(predictionKey1, alpha1, k1, mask);
+                    Duplicate(predictionLo, 0.0f);
                     #pragma unroll 1
                     for (uint16_t row = 0; row < RegBase::LANES; row += 4) {
-                        RegBase::UpdateRows4<stateType, inType>(
-                            destination, source, value + t * D, outLo, columns, firstFour, row,
-                            q0, q1, k0, k1, alpha0, alpha1, strength, mask);
+                        RegBase::PredictVFirstRows4(source, predictionLo, outputRotation, firstFour,
+                            row, predictionKey0, predictionKey1, mask);
                     }
-                    RegTensor<float> outHi;
+                    Duplicate(predictionHi, 0.0f);
+                    #pragma unroll 1
+                    for (uint16_t row = RegBase::LANES; row < D; row += 4) {
+                        RegBase::PredictVFirstRows4(source, predictionHi, outputRotation, firstFour,
+                            row, predictionKey0, predictionKey1, mask);
+                    }
+                    Sub(valueLo, valueLo, predictionLo, mask);
+                    Sub(valueHi, valueHi, predictionHi, mask);
+                    // Reuse the existing 512-byte scratch for residuals, not State.
+                    auto valueFloat = (__ubuf__ float *)(events + 64);
+                    DataCopy(valueFloat, valueLo, mask);
+                    DataCopy(valueFloat + RegBase::LANES, valueHi, mask);
+                    LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+                    // Both layouts collect a full token in two FP32 output registers.
+                    Duplicate(outLo, 0.0f);
+                    #pragma unroll 1
+                    for (uint16_t row = 0; row < RegBase::LANES; row += 4) {
+                        RegBase::UpdateVFirstRows4Second(
+                            destination, source, valueFloat, outLo, outputRotation, firstFour, row,
+                            q0, q1, alpha0, alpha1, updateKey0, updateKey1, mask);
+                    }
                     Duplicate(outHi, 0.0f);
                     #pragma unroll 1
                     for (uint16_t row = RegBase::LANES; row < D; row += 4) {
-                        RegBase::UpdateRows4<stateType, inType>(
-                            destination, source, value + t * D, outHi, columns, firstFour, row,
-                            q0, q1, k0, k1, alpha0, alpha1, strength, mask);
+                        RegBase::UpdateVFirstRows4Second(
+                            destination, source, valueFloat, outHi, outputRotation, firstFour, row,
+                            q0, q1, alpha0, alpha1, updateKey0, updateKey1, mask);
                     }
-                    RegBase::Store(output + t * D, outLo, mask);
-                    RegBase::Store(output + t * D + RegBase::LANES, outHi, mask);
                 } else {
+                    auto valueFloat = (__ubuf__ float *)(events + 64);
+                    DataCopy(valueFloat, valueLo, mask);
+                    DataCopy(valueFloat + RegBase::LANES, valueHi, mask);
+                    LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+                    Duplicate(outLo, 0.0f);
                     #pragma unroll 1
-                    for (uint16_t row = 0; row < D; row += 2) {
-                        RegBase::UpdateRows2<stateType, inType, outType, false>(
-                            destination, source, value + t * D, output + t * D, row,
-                            q0, q1, k0, k1, alpha0, alpha1, strength, columns, pairColumns, mask);
+                    for (uint16_t row = 0; row < RegBase::LANES; row += 4) {
+                        RegBase::UpdateRows4<stateType, float, vFirst>(
+                            destination, source, valueFloat, outLo, outputRotation, firstFour, row,
+                            q0, q1, k0, k1, alpha0, alpha1, strength, updateKey0, updateKey1,
+                            columns, pairColumns, lowHalfMask, mask);
+                    }
+                    Duplicate(outHi, 0.0f);
+                    #pragma unroll 1
+                    for (uint16_t row = RegBase::LANES; row < D; row += 4) {
+                        RegBase::UpdateRows4<stateType, float, vFirst>(
+                            destination, source, valueFloat, outHi, outputRotation, firstFour, row,
+                            q0, q1, k0, k1, alpha0, alpha1, strength, updateKey0, updateKey1,
+                            columns, pairColumns, lowHalfMask, mask);
                     }
                 }
+                RegBase::Store(output + t * D, outLo, mask);
+                RegBase::Store(output + t * D + RegBase::LANES, outHi, mask);
                 LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
                 LocalMemBar<MemType::VEC_STORE, MemType::SCALAR_STORE>();
                 events[0] = token + 1;
@@ -671,6 +786,8 @@ private:
     GlobalTensor<float> aLog_, bias_;
     uint32_t x_, betaSlot_, qOffset_, kOffset_, vOffset_, gateOffset_, betaOffset_, initialBank_, alternateBank_;
     uint32_t paramOffset_, outOffset_, eventOffset_;
+    uint32_t bankUse_[3] = {FREE, FREE, FREE};
+    uint32_t prefetchedBank_ = NO_BANK, pendingStateBank_ = NO_BANK;
 #ifdef RKDA_EXECUTION_TRACE
     GlobalTensor<uint64_t> trace_;
     uint64_t traceCount_ = 0;

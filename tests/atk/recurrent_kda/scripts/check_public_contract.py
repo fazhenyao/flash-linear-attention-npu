@@ -87,9 +87,50 @@ def main():
                                   rtol=1e-5, atol=1e-6)
             assert torch.count_nonzero(final[..., 1:]) == 0
             count += 1
-    for invalid in ["head_ratio", "q_dtype", "state_stride", "dt_bias_without_a_log"]:
-        spec = base_spec(T=17, inplace=True, HV=3 if invalid == "head_ratio" else 4,
-                         use_gate_in_kernel=invalid == "dt_bias_without_a_log")
+    for safe in [False, True]:
+        spec = base_spec(T=9, a_log=False, ignored_gate_parameters=True,
+                         safe_gate=safe, lower_bound=123.0)
+        inputs = build_inputs(spec, device)
+        baseline = {k: v for k, v in inputs.items() if k != "dt_bias"}
+        opts = call_options(spec)
+        expected = recurrent_kda(**baseline, **dict(opts, safe_gate=False, lower_bound=-5.0))
+        actual = recurrent_kda(**inputs, **opts)
+        torch.npu.synchronize()
+        assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+        count += 1
+    # Same descriptors, changing device values: the L2 cache must not reuse an
+    # old packed boundary snapshot or an X selected for a previous length.
+    for dtype in ["int32", "int64"]:
+        for length in [0, 1, 2, 4, 8]:
+            spec = base_spec(B=2, T=length, H=1, HV=1, lengths=[0, length],
+                             padding=32-length, metadata_dtype=dtype, pattern="signal")
+            inputs = build_inputs(spec, device)
+            cu = inputs["cu_seqlens"]
+            backing = torch.full((cu.numel()*3+2,), -100, dtype=cu.dtype, device=device)
+            view = backing[1:1+cu.numel()*3:3]
+            view.copy_(cu)
+            golden = run_cpu(spec, high_precision=True)
+            for metadata in [cu, view]:
+                output, final = recurrent_kda(**dict(inputs, cu_seqlens=metadata), **call_options(spec))
+                if length:
+                    assert compare.compute_accuracy_result(
+                        output[:length].cpu(), golden[0].float(), "output_0.pt").result
+                assert compare.compute_accuracy_result(final.cpu(), golden[1].float(), "output_1.pt").result
+            count += 1
+    for state_dtype in ["fp32", "bf16"]:
+        for gate_dtype in ["fp32", "bf16", "fp16"]:
+            for beta_dtype in ["fp32", "bf16", "fp16"]:
+                spec = base_spec(T=5, H=1, HV=1, state_dtype=state_dtype,
+                                 state_v_first=state_dtype == "fp32", g_dtype=gate_dtype,
+                                 beta_dtype=beta_dtype, use_gate_in_kernel=True,
+                                 use_beta_sigmoid_in_kernel=True)
+                actual = recurrent_kda(**build_inputs(spec, device), **call_options(spec))
+                golden = run_cpu(spec, high_precision=True)
+                assert all(compare.compute_accuracy_result(a.cpu(), b.float(), f"output_{i}.pt").result
+                           for i, (a, b) in enumerate(zip(actual, golden)))
+                count += 1
+    for invalid in ["head_ratio", "q_dtype", "state_stride", "cu_start", "cu_order", "cu_capacity"]:
+        spec = base_spec(T=17, inplace=True, HV=3 if invalid == "head_ratio" else 4)
         inputs = build_inputs(spec, device)
         if invalid == "q_dtype":
             inputs["q"] = inputs["q"].float()
@@ -97,8 +138,9 @@ def main():
             state = inputs["initial_state"]
             inputs["initial_state"] = torch.zeros((*state.shape[:-1], state.shape[-1] * 2),
                                                   device=device)[..., ::2]
-        elif invalid == "dt_bias_without_a_log":
-            inputs["A_log"] = None
+        elif invalid.startswith("cu_"):
+            offsets = {"cu_start": [1, 17], "cu_order": [0, -1], "cu_capacity": [0, 18]}[invalid]
+            inputs["cu_seqlens"] = torch.tensor(offsets, dtype=torch.int64, device=device)
         try:
             recurrent_kda(**inputs, **call_options(spec))
             torch.npu.synchronize()

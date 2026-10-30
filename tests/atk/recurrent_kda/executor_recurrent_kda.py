@@ -116,6 +116,12 @@ def build_inputs(spec: dict[str, Any], device: torch.device, high_precision: boo
             storage = torch.zeros((*tensor.shape[:-1], tensor.shape[-1] * 2), dtype=calc, device=device)
             view = storage[..., ::2] if view_kind == "feature_gap" else storage[..., :tensor.shape[-1]]
             view.copy_(tensor); tensors[name] = view
+    elif view_kind == "batch_gap":
+        for index, (name, tensor) in enumerate(tensors.items()):
+            storage = torch.zeros((B, T + index + 1, tensor.shape[-2], tensor.shape[-1]),
+                                  dtype=calc, device=device)
+            view = storage[:, :T]
+            view.copy_(tensor); tensors[name] = view
     if spec.get("strided_state", False):
         storage = torch.zeros((state_capacity, HV + 1, *tail), dtype=sd, device=device)
         view = storage[:, :HV]; view.copy_(state); state = view
@@ -129,6 +135,9 @@ def build_inputs(spec: dict[str, Any], device: torch.device, high_precision: boo
         inputs["A_log"] = a_log.to(aux).to(device)
         inputs["dt_bias"] = (None if spec.get("dt_bias_none", False) else
                              _randn((HV, K), "fp32", aux, device, seed + 8, scale=0.05))
+    elif spec.get("ignored_gate_parameters"):
+        # Deliberately invalid raw-gate dtype/shape/device: inactive inputs are ignored.
+        inputs["dt_bias"] = torch.zeros(3, dtype=torch.int32)
     return inputs
 
 
@@ -140,7 +149,8 @@ def call_options(spec):
                 use_gate_in_kernel=bool(spec.get("use_gate_in_kernel", False)),
                 use_beta_sigmoid_in_kernel=bool(spec.get("use_beta_sigmoid_in_kernel", False)),
                 allow_neg_eigval=bool(spec.get("allow_neg_eigval", False)),
-                safe_gate=bool(spec.get("safe_gate", False)))
+                safe_gate=bool(spec.get("safe_gate", False)),
+                lower_bound=spec.get("lower_bound", -5.0))
 
 
 # CPU reference copied from the operator PTA reference so this executor is self-contained.

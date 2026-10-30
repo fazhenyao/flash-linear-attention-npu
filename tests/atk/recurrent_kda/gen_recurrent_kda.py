@@ -169,6 +169,37 @@ if GENERATOR_REGISTRY is not None:
             return case_config
 
 
+def alignment_specs():
+    """Small matrix for the revised A5 register/bank/metadata contract."""
+    result = []
+    for state_dtype in ("fp32", "bf16"):
+        for v_first in (True, False):
+            for snapshots in (False, True):
+                result.append(base_spec(
+                    name=f"align_{state_dtype}_{v_first}_{snapshots}", B=2, T=17, H=2, HV=32,
+                    state_dtype=state_dtype, state_v_first=v_first, inplace=True,
+                    indices=("packed" if v_first else "speculative") if snapshots else None,
+                    accepted=2, metadata_dtype="int32" if snapshots else "int64",
+                    use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+                    use_beta_sigmoid_in_kernel=True, safe_gate=not v_first,
+                    strided_state=True))
+    for length in (1, 2, 4, 8):
+        result.append(base_spec(name=f"align_lmax_{length}", lengths=[0, length, length - 1],
+                                padding=32, state_v_first=False, g_dtype="fp16", beta_dtype="fp16"))
+    result.append(base_spec(name="align_all_empty", lengths=[0, 0], padding=16))
+    for v_first in (True, False):
+        result.append(base_spec(name=f"align_batch_gap_{v_first}", B=2, T=9, cu=False,
+                                qkv_view="batch_gap", state_v_first=v_first,
+                                state_dtype="bf16", use_qk_l2norm_in_kernel=True))
+    for safe in (False, True):
+        result.append(base_spec(name=f"align_ignored_gate_{safe}", T=9, a_log=False,
+                                ignored_gate_parameters=True, safe_gate=safe, lower_bound=123.0))
+    result.append(base_spec(name="align_dense32", B=2, T=32, cu=False,
+                            use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True))
+    return [dict(spec, seed=20261029 + seed, case_id=3 * index + seed)
+            for index, spec in enumerate(result) for seed in range(3)]
+
+
 def generate_packages():
     # Accuracy candidates, user model shapes, and manually selected key paths
     # have separate sources; performance/mss are never synthesized by gen_cases.
@@ -179,6 +210,7 @@ def generate_packages():
         "atk_recurrent_kda.json": [_spec(i) for i in range(len(PROFILES) * 3)],
         "atk_recurrent_kda_perf.json": model_specs(),
         "atk_recurrent_kda_contract.json": contract_specs(),
+        "atk_recurrent_kda_alignment.json": alignment_specs(),
         "atk_recurrent_kda_typical.json": typical_specs(),
         "atk_recurrent_kda_perf_typical.json": typical_model_specs(),
         "atk_recurrent_kda_mss.json": [base_spec(**item) for item in [

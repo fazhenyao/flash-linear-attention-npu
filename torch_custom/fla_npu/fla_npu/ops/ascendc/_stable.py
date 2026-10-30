@@ -605,6 +605,8 @@ def npu_recurrent_kda(
     # Stable ABI still carries an integer slot for the legacy attribute, but
     # the recurrent kernel ignores its value.
     layout_code = 0
+    if A_log is None:
+        dt_bias, safe_gate, lower_bound = None, False, -5.0
 
     # The contract only covers the in-place form: with
     # `inplace_final_state=False` the caller's tensor is not written (the

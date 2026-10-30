@@ -140,6 +140,11 @@ RecurrentKdaTilingContext RecurrentKdaTiling::BuildProcessorContext() const
     ctx.aivNum = compileInfo_.aivNum;
     ctx.ubSize = compileInfo_.ubSize;
     ctx.isA5 = compileInfo_.isA5 ? 1 : 0;
+    if (ctx.isA5 && tilingData_.hasCuSeqlens) {
+        const auto *cu = context_->GetOptionalInputTensor(CU_SEQLENS_INDEX);
+        if (cu != nullptr && gert::TensorPlacementUtils::IsOnHost(cu->GetPlacement()))
+            ctx.cuSeqlensData = cu->GetData<uint8_t>();
+    }
     ctx.stateDtype = context_->GetInputDesc(STATE_INDEX)->GetDataType();
     ctx.gateDtype = context_->GetInputDesc(GATE_INDEX)->GetDataType();
     ctx.betaDtype = context_->GetInputDesc(BETA_INDEX)->GetDataType();
@@ -298,7 +303,7 @@ ge::graphStatus RecurrentKdaTiling::AnalyzeDtype()
                     OP_LOGE(context_->GetNodeName(), "A_log dtype should be float32"),
                     return ge::GRAPH_FAILED);
     }
-    if (context_->GetOptionalInputDesc(DT_BIAS_INDEX) != nullptr) {
+    if (tilingData_.hasDtBias) {
         OP_CHECK_IF(context_->GetOptionalInputDesc(DT_BIAS_INDEX)->GetDataType() != ge::DT_FLOAT,
                     OP_LOGE(context_->GetNodeName(), "dt_bias dtype should be float32"),
                     return ge::GRAPH_FAILED);
@@ -346,6 +351,7 @@ ge::graphStatus RecurrentKdaTiling::AnalyzeFormat()
         {ACC_TOKEN_INDEX, "num_accepted_tokens"},
     }};
     for (const auto &item : optionalInputs) {
+        if (item.first == DT_BIAS_INDEX && !tilingData_.hasALog) continue;
         auto desc = context_->GetOptionalInputDesc(item.first);
         if (desc != nullptr && !CheckFormat(desc->GetStorageFormat(), item.second)) {
             return ge::GRAPH_FAILED;
@@ -372,7 +378,7 @@ ge::graphStatus RecurrentKdaTiling::GetAttrsInfo()
     tilingData_.useGateInKernel = tilingData_.hasALog ? 1 : 0;
     tilingData_.useBetaSigmoid = *attrs->GetAttrPointer<bool>(ATTR_USE_BETA_SIGMOID_INDEX) ? 1 : 0;
     tilingData_.allowNegEigval = *attrs->GetAttrPointer<bool>(ATTR_ALLOW_NEG_EIGVAL_INDEX) ? 1 : 0;
-    tilingData_.safeGate = *attrs->GetAttrPointer<bool>(ATTR_SAFE_GATE_INDEX) ? 1 : 0;
+    tilingData_.safeGate = tilingData_.hasALog && *attrs->GetAttrPointer<bool>(ATTR_SAFE_GATE_INDEX) ? 1 : 0;
     tilingData_.lowerBound = *attrs->GetAttrPointer<float>(ATTR_LOWER_BOUND_INDEX);
     tilingData_.stateVFirst = *attrs->GetAttrPointer<bool>(ATTR_STATE_V_FIRST_INDEX) ? 1 : 0;
     return ge::GRAPH_SUCCESS;
@@ -383,7 +389,7 @@ ge::graphStatus RecurrentKdaTiling::GetOptionalInput()
     tilingData_.hasCuSeqlens = (context_->GetOptionalInputDesc(CU_SEQLENS_INDEX) == nullptr) ? 0 : 1;
     tilingData_.hasSsmStateIndices = (context_->GetOptionalInputDesc(SSM_STATE_INDICES_INDEX) == nullptr) ? 0 : 1;
     tilingData_.hasALog = (context_->GetOptionalInputDesc(A_LOG_INDEX) == nullptr) ? 0 : 1;
-    tilingData_.hasDtBias = (context_->GetOptionalInputDesc(DT_BIAS_INDEX) == nullptr) ? 0 : 1;
+    tilingData_.hasDtBias = tilingData_.hasALog && context_->GetOptionalInputDesc(DT_BIAS_INDEX) != nullptr ? 1 : 0;
     tilingData_.hasAcceptedTokens = (context_->GetOptionalInputDesc(ACC_TOKEN_INDEX) == nullptr) ? 0 : 1;
     return ge::GRAPH_SUCCESS;
 }
@@ -395,6 +401,7 @@ void RecurrentKdaTiling::PrintTilingData()
     OP_LOGD(context_->GetNodeName(), "ubRestBytes: [%u]", tilingData_.ubRestBytes);
     OP_LOGD(context_->GetNodeName(), "t: [%u]", tilingData_.t);
     OP_LOGD(context_->GetNodeName(), "seqLen: [%u]", tilingData_.seqLen);
+    OP_LOGD(context_->GetNodeName(), "windowSize: [%u]", tilingData_.windowSize);
     OP_LOGD(context_->GetNodeName(), "nk: [%u]", tilingData_.nk);
     OP_LOGD(context_->GetNodeName(), "dk: [%u]", tilingData_.dk);
     OP_LOGD(context_->GetNodeName(), "nv: [%u]", tilingData_.nv);
@@ -470,6 +477,7 @@ static ge::graphStatus TilingPrepareForRecurrentKda(gert::TilingParseContext *co
 }
 
 IMPL_OP_OPTILING(RecurrentKda)
+    .TilingInputsDataDependency({CU_SEQLENS_INDEX})
     .Tiling(RecurrentKdaTilingFunc)
     .TilingParse<RecurrentKdaCompileInfo>(TilingPrepareForRecurrentKda);
 } // namespace optiling
