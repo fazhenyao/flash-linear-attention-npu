@@ -226,7 +226,8 @@ recurrent_kda<<<blockDim, nullptr, stream>>>(
 
 | 条件 | 返回码/异常 |
 | --- | --- |
-| 必选 tensor、workspaceSize 或 executor 为空 | `ACLNN_ERR_PARAM_NULLPTR` |
+| 必选 tensor 为空 | `ACLNN_ERR_PARAM_INVALID`（参数校验分支） |
+| workspaceSize 或 executor 为空 | `ACLNN_ERR_PARAM_NULLPTR` |
 | rank/shape/dtype/layout、活跃 slot/accepted 或属性组合非法（含启用 safe gate 时的 NaN lower_bound） | `ACLNN_ERR_PARAM_INVALID` |
 | 内部 tensor 创建或 L0 调用失败 | `ACLNN_ERR_INNER_NULLPTR` |
 | Python 输入不是 NPU tensor 或 runtime/op_api 未加载 | `RuntimeError` |

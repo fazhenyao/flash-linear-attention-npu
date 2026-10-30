@@ -174,6 +174,18 @@ static bool SameTensorView(const aclTensor *lhs, const aclTensor *rhs)
            SameViewStrides(lhs, rhs);
 }
 
+static bool SameTensorStorage(const aclTensor *lhs, const aclTensor *rhs)
+{
+    return lhs != nullptr && rhs != nullptr && lhs->GetStorageAddr() != nullptr &&
+           lhs->GetStorageAddr() == rhs->GetStorageAddr();
+}
+
+static const uint8_t *ViewData(const aclTensor *tensor, uint64_t elementBytes)
+{
+    return static_cast<const uint8_t *>(tensor->GetStorageAddr()) +
+           uint64_t(tensor->GetViewOffset()) * elementBytes;
+}
+
 bool IsSupportedQkvView(const aclTensor *tensor, RecurrentKdaLayout layout)
 {
     if (tensor == nullptr) {
@@ -270,7 +282,15 @@ bool CheckQkvMaterializationSafety(
         return false;
     }
     if (layout == RecurrentKdaLayout::BSND && Dim(tensor, DIM0) > 1) {
-        const int64_t batchSpan = std::max(tokenMajorSpan, headMajorSpan);
+        if (tokenCount > 1 && tokenStride >
+            (maxInt64 - tokenMajorSpan) / (tokenCount - 1)) {
+            OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON("aclnnRecurrentKda", name,
+                "expected representable full batch span; actual " + TensorDescription(tensor));
+            return false;
+        }
+        const int64_t fullViewSpan = (tokenCount - 1) * tokenStride +
+                                     (headCount - 1) * headStride + featureCount;
+        const int64_t batchSpan = fullViewSpan;
         if (strides[DIM0] < batchSpan) {
             OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON("aclnnRecurrentKda", name,
                 "expected batch stride covering the view; actual " + TensorDescription(tensor));
@@ -640,9 +660,7 @@ aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *exec
     }
     const uint64_t bytes = (uint64_t(count - 1) * uint64_t(stride) + 1) * width;
     std::vector<uint8_t> storage(bytes);
-    // GetData resolves both storage and view offsets; GetStorageAddr alone can
-    // point before the logical view after the executor binds its storage.
-    const auto *source = static_cast<const uint8_t *>(cu->GetData());
+    const auto *source = ViewData(cu, width);
     if (gert::TensorPlacementUtils::IsOnHost(cu->GetPlacement())) {
         std::memcpy(storage.data(), source, bytes);
     } else {
@@ -690,7 +708,8 @@ struct MetadataSlice {
 
 int64_t IntegerMetadataValue(const aclTensor *tensor, uint64_t index)
 {
-    const auto *data = static_cast<const uint8_t *>(tensor->GetData());
+    const uint64_t width = tensor->GetDataType() == DataType::DT_INT32 ? sizeof(int32_t) : sizeof(int64_t);
+    const auto *data = ViewData(tensor, width);
     if (tensor->GetDataType() == DataType::DT_INT32) {
         int32_t value;
         std::memcpy(&value, data + index * sizeof(value), sizeof(value));
@@ -730,7 +749,7 @@ aclnnStatus SnapshotMetadata(const aclTensor *&tensor, const char *name,
     CHECK_RET(host != nullptr, ACLNN_ERR_INNER_NULLPTR);
     auto *destination = static_cast<uint8_t *>(host->GetData());
     std::memset(destination, 0, elements * width);
-    const auto *source = static_cast<const uint8_t *>(tensor->GetData());
+    const auto *source = ViewData(tensor, width);
     const bool onHost = gert::TensorPlacementUtils::IsOnHost(tensor->GetPlacement());
     if (!onHost && !slices.empty() && !synchronized) {
         const auto status = aclrtSynchronizeDevice();
@@ -997,6 +1016,13 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     // Empty requests and untouched pool slots must preserve their initial value
     // on every public entry, including direct ACLNN and ctypes. Enqueue the copy
     // before recurrence; the executor orders both writes to the same output.
+    if (!params.inplaceFinalState && params.outputFinalState &&
+        SameTensorStorage(params.initialStateRef, params.finalState)) {
+        OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
+            "aclnnRecurrentKda", "finalState",
+            "non-inplace output must use storage independent from initialStateRef");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
     if (!params.inplaceFinalState && params.outputFinalState &&
         !SameTensorView(params.initialStateRef, params.finalState)) {
         CHECK_RET(CopyStateView(initialStateForKernel, finalStateForKernel, executorPtr) == ACLNN_SUCCESS,

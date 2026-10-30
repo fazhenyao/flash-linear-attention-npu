@@ -21,7 +21,9 @@ def direct_aclnn(q, k, v, g, beta, initial_state, **options):
     shape, strides = initial_state.shape, initial_state.stride()
     span = sum((size - 1) * stride for size, stride in zip(shape, strides)) + 1
     storage = torch.full((span + 32,), 17.0, dtype=initial_state.dtype, device=initial_state.device)
-    final = torch.as_strided(storage, shape, strides, storage_offset=16)
+    final = options.get("_final_state_override")
+    if final is None:
+        final = torch.as_strided(storage, shape, strides, storage_offset=16)
     names = ("cu_seqlens", "ssm_state_indices", "A_log", "dt_bias", "num_accepted_tokens")
     inputs = (q, k, v, g, beta, initial_state, *(options.get(name) for name in names))
     layout = ctypes.create_string_buffer(options.get("layout", "BSND").encode())
@@ -41,6 +43,15 @@ def direct_aclnn(q, k, v, g, beta, initial_state, **options):
     torch.npu.synchronize()
     assert torch.all(storage[:16] == 17) and torch.all(storage[-16:] == 17)
     return out, final
+
+
+def strided_metadata(tensor):
+    strides = (3,) if tensor.ndim == 1 else (tensor.shape[1] * 3 + 5, 3)
+    span = sum((size - 1) * stride for size, stride in zip(tensor.shape, strides)) + 1
+    backing = torch.full((span + 8,), -99, dtype=tensor.dtype, device=tensor.device)
+    view = torch.as_strided(backing, tensor.shape, strides, storage_offset=3)
+    view.copy_(tensor)
+    return view
 
 
 def main():
@@ -108,6 +119,56 @@ def main():
                     count += 1
                     print("REVIEW_CASE_OK", backend, v_first, dtype, scenario, flush=True)
     rejected = 0
+    for v_first in (True, False):
+        for dtype in ("fp32", "bf16"):
+            spec = base_spec(B=1, T=2, H=1, HV=1, state_dtype=dtype,
+                             state_v_first=v_first, inplace=False, pattern="signal")
+            inputs = build_inputs(spec, device)
+            try:
+                alias_options = call_options(spec)
+                alias_options.update(_final_state_override=inputs["initial_state"],
+                                     output_final_state=True, inplace_final_state=False)
+                direct_aclnn(**inputs, **alias_options)
+                raise AssertionError(("aclnn", "accepted non-inplace State alias", v_first, dtype))
+            except (RuntimeError, ValueError) as exc:
+                message = str(exc)
+                assert "finalState" in message and "161002" in message, message
+                rejected += 1
+                print("REVIEW_ALIAS_REJECTED", v_first, dtype, flush=True)
+    for backend, call in backends.items():
+        spec = base_spec(B=3, T=2, H=1, HV=1, lengths=[0, 2, 1], padding=2,
+                         indices="packed", accepted=1, layout="TND", state_v_first=True,
+                         state_dtype="fp32", metadata_dtype="int32", inplace=False,
+                         pattern="signal")
+        inputs = build_inputs(spec, device)
+        for name in ("cu_seqlens", "ssm_state_indices", "num_accepted_tokens"):
+            inputs[name] = strided_metadata(inputs[name])
+        inputs["num_accepted_tokens"][0] = -99
+        torch.npu.synchronize()
+        output, final = call(**inputs, **call_options(spec))
+        torch.npu.synchronize()
+        golden = run_cpu(spec, high_precision=True)
+        assert compare.compute_accuracy_result(output.cpu()[:3], golden[0].float(), "output_0.pt").result
+        assert compare.compute_accuracy_result(final.cpu(), golden[1].float(), "output_1.pt").result
+        count += 1
+        print("REVIEW_METADATA_VIEW_OK", backend, flush=True)
+    for backend, call in backends.items():
+        spec = base_spec(B=2, T=2, H=2, HV=2, cu=False, inplace=False, pattern="signal")
+        inputs = build_inputs(spec, device)
+        for name in ("q", "k", "v"):
+            tensor = inputs[name]
+            storage = torch.arange(896, dtype=torch.float32, device=device).to(tensor.dtype)
+            inputs[name] = torch.as_strided(storage, tensor.shape, (384, 256, 128, 1))
+        try:
+            call(**inputs, **call_options(spec))
+            torch.npu.synchronize()
+        except (RuntimeError, ValueError) as exc:
+            message = str(exc)
+            assert "query" in message and "161002" in message, (backend, message)
+            rejected += 1
+            print("REVIEW_OVERLAP_REJECTED", backend, flush=True)
+        else:
+            raise AssertionError((backend, "accepted overlapping BSND QKV descriptor"))
     for backend, call in backends.items():
         for invalid in ("head_ratio", "q_dtype", "state_stride", "cu_start", "cu_order", "cu_capacity",
                         "slot_negative", "slot_capacity", "accepted_zero", "accepted_length",
