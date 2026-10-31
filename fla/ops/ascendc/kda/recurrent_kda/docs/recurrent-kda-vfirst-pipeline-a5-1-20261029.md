@@ -83,7 +83,7 @@ msprof op simulator --soc-version=Ascend950PR_957c \
 
 ## 结果位置
 
-- 本机：`D:/PROJECT/flash-linear-attention-npu/output/rkda-vfirst-worst-pipeline-20261029/`。
+- 本机：`output/rkda-vfirst-worst-pipeline-20261029/`。
 - A5_1：`<run-root>/rkda-vfirst-worst-pipeline-20261029/`，保留完整 OPPROF 目录、正常设备输出、原始输入 storage、tiling 和日志。
 - 本机证据包 `pipeline-evidence.tar.gz` 包含四轮导出 trace、两个 AIV 的原模型解析结果、指令 CSV、图、脚本、日志、绑定和 SHA256 索引；大体积正常调用输出 NPY 和输入 storage 留在服务器，未加入包。
 - 初始 host 诊断链接及 metadata 过滤曾失败，均发生在正式采集之前；修正后四轮采集使用相同正式 `.o`。未重试此前已知失败的真机 PipeTimeline 路径。

@@ -332,8 +332,8 @@ __aicore__ inline void RecurrentKdaDispatchLayout(RKDAVectorContext<inType, outT
         if (ctx.x_ == 1) {
             if (ctx.td_->useQkL2norm && ctx.td_->hasALog && ctx.td_->hasDtBias && ctx.td_->useBetaSigmoid &&
                 !ctx.td_->allowNegEigval && !ctx.td_->safeGate && !ctx.td_->hasSsmStateIndices) {
-                Stage1LaunchRecurrentKdaVF<Gate, Beta, true, true, 0, false>(ctx, base, valid, slot, parameter, last);
-            } else Stage1LaunchRecurrentKdaVF<Gate, Beta, true, false, 0, false>(ctx, base, valid, slot, parameter, last);
+                Stage1LaunchRecurrentKdaVF<Gate, Beta, true, true, 0, true>(ctx, base, valid, slot, parameter, last);
+            } else Stage1LaunchRecurrentKdaVF<Gate, Beta, true, false, 0, true>(ctx, base, valid, slot, parameter, last);
             return;
         }
         // Specialize the common fused recurrence to retire runtime flags

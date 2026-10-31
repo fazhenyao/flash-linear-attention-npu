@@ -1,10 +1,23 @@
-"""Shape-only aliases for recurrent_kda calls published before v26.10.
+"""Operator-local input compatibility and metadata readiness for recurrent_kda.
 
 The operator itself selects packed mode exclusively by cu_seqlens presence.
 Keep these aliases through v26.12; remove no earlier than v27.1.
 """
 
 import warnings
+
+
+def wait_for_metadata(q, cu_seqlens, ssm_state_indices):
+    """Complete framework producers before ACLNN reads device metadata on host.
+
+    ACL runtime synchronization alone cannot flush the framework's pending
+    submissions. Other streams must establish their dependency on this stream,
+    as for ordinary tensor inputs. Dense calls without metadata stay asynchronous.
+    """
+    if (cu_seqlens is not None or ssm_state_indices is not None) and q.device.type == "npu":
+        import torch
+
+        torch.npu.current_stream(q.device).synchronize()
 
 
 def normalize_inputs(q, k, v, g, beta, cu_seqlens):

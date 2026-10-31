@@ -97,7 +97,8 @@ shape、storage、stride 和 offset，kernel 按 tiling
 中的真实 stride 直接访问。原位模式直接写回输入 view；非原位模式直接写入 `finalState` view。原位模式若调用者
 另外传入独立的 `finalState` 输出，仅为该输出保留一次必要的 `ViewCopy`。`cuSeqlensOptional` 为空时，BSND
 标准表示使用 rank4 BSND；提供时标准表示使用 rank3 TND；旧 shape 别名见第 4.1 节。A5 host 通过 cu_seqlens 值依赖计算最大有效序列长度，选择不超过8的 X；元数据复制或同步开销计入调用链。
-A5 的设备 cu_seqlens 在 `GetWorkspaceSize` 中经 `aclrtSynchronizeDevice` 和 D2H 复制取得，随后由 executor 持有 host 常量并向 kernel 提供该次值。固定长度路径不增加这次同步。
+A2/A3/A5 的设备 cu_seqlens 均在 `GetWorkspaceSize` 中经 `aclrtSynchronizeDevice` 和 D2H 复制取得，校验起点、单调性及容量后，由 executor 持有 host 常量并向 kernel 提供该次值；不论是否传入 indices，均禁用依赖旧元数据的 executor 缓存。A5 还使用该快照选择 X。固定长度且无 indices 的路径不增加元数据同步。
+stable/ctypes Python 入口在存在 CU 或 indices 时，先等待 PyTorch 当前 NPU stream，保证框架队列中的元数据生产者已提交并完成，再进入 ACLNN host 快照阶段。其他 stream 产生的输入须先按 PyTorch 规则向当前 stream 建立依赖。直接调用 ACLNN 时，调用方须保证设备元数据生产者已提交并完成；单独的 ACL runtime 同步不能替代框架提交队列的排空。这些同步成本属于调用链，不包含在目标 kernel 计时中。
 当前 packed 路径不能在 ACLGraph 捕获中调用；改变 cu_seqlens 后须重新创建 executor，不能依赖旧 executor/ACLGraph 自动更新边界或 X。device 仍核验元数据。首项必须为 0，offset 必须单调不减，末项不得超过输入 token capacity，
 A5 使用固定容量窗口递推，不限制每段长度为8；A2/A3仍按各自实现的支持范围执行。
 输入、输出、workspace 和 executor 必须保持有效，直到 stream 完成。
@@ -211,7 +212,7 @@ recurrent_kda<<<blockDim, nullptr, stream>>>(
 - `ssm_state_indices` 支持 packed `[T]` 和 speculative `[seq_num,max_step]`；活跃序列不得共享正在写入的 state slot。
 - `num_accepted_tokens[b]` 对非空请求须在 `[1, length[b]]` 内，只选择初态槽，不截短本次计算。
 - 空序列不读取 `ssm_state_indices/num_accepted_tokens`，speculative padding 不参与值校验，也不读写空序列的 state pool。
-- 传入 indices 时，ACLNN 第一阶段在 host 校验活跃 slot/accepted 及 speculative 容量，保存校验后的元数据快照供本次 executor 消费。非法值返回 `ACLNN_ERR_PARAM_INVALID`，消息包含请求、token、实际值及边界。设备元数据读取需要同步及 D2H，与已有 A5 CU 快照共享必要同步；无 indices 的调用不增加这项开销。使用 indices 的调用不支持 ACLGraph 捕获，修改元数据后须重建 executor。
+- 传入 indices 时，ACLNN 第一阶段在 host 校验活跃 slot/accepted 及 speculative 容量，保存校验后的元数据快照供本次 executor 消费。非法值返回 `ACLNN_ERR_PARAM_INVALID`，消息包含请求、token、实际值及边界。设备元数据读取需要同步及 D2H，与已有 CU 快照共享必要同步；无 indices 的调用不增加 slot/accepted 快照开销，但 packed 调用仍执行上述 CU 校验。使用 indices 的调用不支持 ACLGraph 捕获，修改元数据后须重建 executor。
 - `cu_seqlens` 可选；标准表示为空时为 rank4 BSND，按 batch 行划分；提供时为 rank3 packed TND；旧 shape 别名见第 4.1 节。提供时首项必须为 0，offset
   必须单调不减，末项为有效 token 数且不得超过输入
   token capacity；相邻差值为序列长度。A5 host 读取实际值选择 X，device kernel 仍检查边界。

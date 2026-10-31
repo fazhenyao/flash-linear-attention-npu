@@ -798,30 +798,22 @@ private:
         return ge::GRAPH_SUCCESS;
     }
 
-    int64_t CalcFixedUbBytes(int64_t aNv, int64_t aDv, int64_t aDk) const
+    int64_t CalcFixedUbBytes(int64_t aNv, int64_t aDv, int64_t aDk, uint32_t nv) const
     {
-        const int64_t maxMtp = ctx_.isA5 != 0 ? static_cast<int64_t>(RKDA_A5_MAX_MTP) :
-                                               static_cast<int64_t>(RKDA_MAX_MTP);
-        const int64_t windowBufferNum = ctx_.isA5 != 0 ? 2 : 1;
-        int64_t usedUbBytes = 0;
-        usedUbBytes += windowBufferNum * maxMtp * (4 * aDk + 2 * aDv); // q/k/v input queues.
-        usedUbBytes += windowBufferNum * maxMtp * 4 * aDk;             // gate input queue.
-        const int64_t betaWidth = ctx_.isA5 != 0 ? 16 : aNv;
-        usedUbBytes += windowBufferNum * maxMtp * 4 * betaWidth;       // beta rows, padded to 16.
-        usedUbBytes += 64 + RKDA_UB_GUARD_BYTES;             // scalar buffer and guard.
+        const int64_t rawBytes = RKDA_MAX_MTP * (8 * aDk + 2 * aDv);
+        const int64_t rawBufferNum = ctx_.isA5 != 0 ? 1 : 2;
+        const int64_t betaHeads = ctx_.isA5 != 0 ? aNv : static_cast<int64_t>(nv);
+        int64_t usedUbBytes = rawBufferNum * rawBytes;
+        usedUbBytes += RKDA_MAX_MTP * 4 * betaHeads;
+        usedUbBytes += 64 + RKDA_UB_GUARD_BYTES;
         return usedUbBytes;
     }
 
-    int64_t CalcWorkingUbBytes(int64_t aNv, int64_t aDv, int64_t aDk) const
+    int64_t CalcWorkingUbBytes(int64_t aNv, int64_t aDv, int64_t aDk, uint32_t nv) const
     {
-        const int64_t maxMtp = ctx_.isA5 != 0 ? static_cast<int64_t>(RKDA_A5_MAX_MTP) :
-                                               static_cast<int64_t>(RKDA_MAX_MTP);
-        int64_t usedUbBytes = CalcFixedUbBytes(aNv, aDv, aDk);
-        const int64_t betaWidth = ctx_.isA5 != 0 ? 16 : aNv;
-        usedUbBytes += maxMtp * (4 * aDv + 12 * aDk + 4 * betaWidth);
-        if (ctx_.isA5 != 0) {
-            usedUbBytes += maxMtp * 4 * aDk; // Preprocessing cannot alias live state.
-        }
+        const int64_t betaHeads = ctx_.isA5 != 0 ? aNv : static_cast<int64_t>(nv);
+        int64_t usedUbBytes = CalcFixedUbBytes(aNv, aDv, aDk, nv);
+        usedUbBytes += RKDA_MAX_MTP * (4 * aDv + 12 * aDk + 4 * betaHeads);
         return usedUbBytes;
     }
 
@@ -927,6 +919,16 @@ private:
             ReportInvalid("UB/shape", "ubRestBytes should be non-negative, but got %ld", ubRestBytes);
             return ge::GRAPH_FAILED;
         }
+        if (ctx_.isA5 == 0) {
+            const int64_t tmpBytes = ubCalcCtx.workingUbBytes - ubCalcCtx.fixedUbBytes +
+                                     CalcComputeUbCoeff(aDk) * static_cast<int64_t>(selected.vStep);
+            OP_CHECK_IF(tmpBytes > ubRestBytes,
+                        ReportInvalid("UB/shape", "compute UB bytes %ld exceed available bytes %ld",
+                                      tmpBytes, ubRestBytes),
+                        return ge::GRAPH_FAILED);
+            // Allocate only the named live scratch slices used by the generic kernel.
+            ubRestBytes = tmpBytes;
+        }
         if (ctx_.isA5 != 0) {
             // Match arch35 InitLocalBuffers: fixed FP32 window tensors plus
             // the live state and row outputs. The unused UB tail is not scratch.
@@ -959,15 +961,14 @@ private:
 
     ge::graphStatus RuleCalcFixedUbBytes(RecurrentKdaTilingData &tiling, UbCalcContext &ubCalcCtx) const
     {
-        ubCalcCtx.fixedUbBytes = CalcFixedUbBytes(ubCalcCtx.aNv, ubCalcCtx.aDv, ubCalcCtx.aDk);
+        ubCalcCtx.fixedUbBytes = CalcFixedUbBytes(ubCalcCtx.aNv, ubCalcCtx.aDv, ubCalcCtx.aDk, tiling.nv);
         tiling.ubRestBytes = static_cast<uint32_t>(ubCalcCtx.ubSize - ubCalcCtx.fixedUbBytes);
         return ge::GRAPH_SUCCESS;
     }
 
     ge::graphStatus RuleCalcWorkingUbBytes(RecurrentKdaTilingData &tiling, UbCalcContext &ubCalcCtx) const
     {
-        (void)tiling;
-        ubCalcCtx.workingUbBytes = CalcWorkingUbBytes(ubCalcCtx.aNv, ubCalcCtx.aDv, ubCalcCtx.aDk);
+        ubCalcCtx.workingUbBytes = CalcWorkingUbBytes(ubCalcCtx.aNv, ubCalcCtx.aDv, ubCalcCtx.aDk, tiling.nv);
         return ge::GRAPH_SUCCESS;
     }
 

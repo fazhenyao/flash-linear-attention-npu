@@ -31,6 +31,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstdarg>
+#include <utility>
 
 using namespace op;
 
@@ -470,46 +471,48 @@ bool CheckShape(const RecurrentKdaParams &params, bool varlen)
 
 bool CheckNotNull(const RecurrentKdaParams &params)
 {
-    OP_CHECK_NULL(params.query, return false);
-    OP_CHECK_NULL(params.key, return false);
-    OP_CHECK_NULL(params.value, return false);
-    OP_CHECK_NULL(params.gate, return false);
-    OP_CHECK_NULL(params.beta, return false);
-    OP_CHECK_NULL(params.initialStateRef, return false);
-    OP_CHECK_NULL(params.attnOut, return false);
-    OP_CHECK_NULL(params.finalState, return false);
+    const std::pair<const aclTensor *, const char *> required[] = {
+        {params.query, "query"}, {params.key, "key"}, {params.value, "value"},
+        {params.gate, "gate"}, {params.beta, "beta"}, {params.initialStateRef, "initialStateRef"},
+        {params.attnOut, "attnOut"}, {params.finalState, "finalState"},
+    };
+    for (const auto &item : required) {
+        if (item.first == nullptr) {
+            OP_LOGE_WITH_INVALID_INPUT("aclnnRecurrentKda", item.second);
+            return false;
+        }
+    }
     return true;
 }
 
 bool CheckDtypeValid(const RecurrentKdaParams &params)
 {
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.query, QKV_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.key, QKV_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.value, QKV_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.gate, GATE_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.beta, GATE_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.initialStateRef, STATE_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.attnOut, QKV_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.finalState, STATE_TYPE_SUPPORT_LIST, return false);
+    const auto check = [](const aclTensor *tensor, const char *name, const auto &supported) {
+        if (tensor != nullptr && !CheckType(tensor->GetDataType(), supported)) {
+            OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON("aclnnRecurrentKda", name,
+                op::ToString(tensor->GetDataType()).GetString(),
+                std::string("supported dtypes: ") + op::ToString(supported).GetString());
+            return false;
+        }
+        return true;
+    };
+    if (!check(params.query, "query", QKV_TYPE_SUPPORT_LIST)) return false;
+    if (!check(params.key, "key", QKV_TYPE_SUPPORT_LIST)) return false;
+    if (!check(params.value, "value", QKV_TYPE_SUPPORT_LIST)) return false;
+    if (!check(params.gate, "gate", GATE_TYPE_SUPPORT_LIST)) return false;
+    if (!check(params.beta, "beta", GATE_TYPE_SUPPORT_LIST)) return false;
+    if (!check(params.initialStateRef, "initialStateRef", STATE_TYPE_SUPPORT_LIST)) return false;
+    if (!check(params.attnOut, "attnOut", QKV_TYPE_SUPPORT_LIST)) return false;
+    if (!check(params.finalState, "finalState", STATE_TYPE_SUPPORT_LIST)) return false;
     if (params.finalState->GetDataType() != params.initialStateRef->GetDataType()) {
         ReportInvalid(params, "finalState", "npu_recurrent_kda: finalState dtype must match initialStateRef.");
         return false;
     }
-    if (params.cuSeqlensOptional != nullptr) {
-        OP_CHECK_DTYPE_NOT_SUPPORT(params.cuSeqlensOptional, INT_TYPE_SUPPORT_LIST, return false);
-    }
-    if (params.ssmStateIndicesOptional != nullptr) {
-        OP_CHECK_DTYPE_NOT_SUPPORT(params.ssmStateIndicesOptional, INT_TYPE_SUPPORT_LIST, return false);
-    }
-    if (params.aLogOptional != nullptr) {
-        OP_CHECK_DTYPE_NOT_SUPPORT(params.aLogOptional, F32_TYPE_SUPPORT_LIST, return false);
-    }
-    if (params.dtBiasOptional != nullptr) {
-        OP_CHECK_DTYPE_NOT_SUPPORT(params.dtBiasOptional, F32_TYPE_SUPPORT_LIST, return false);
-    }
-    if (params.numAcceptedTokensOptional != nullptr) {
-        OP_CHECK_DTYPE_NOT_SUPPORT(params.numAcceptedTokensOptional, INT_TYPE_SUPPORT_LIST, return false);
-    }
+    if (!check(params.cuSeqlensOptional, "cu_seqlens", INT_TYPE_SUPPORT_LIST)) return false;
+    if (!check(params.ssmStateIndicesOptional, "ssm_state_indices", INT_TYPE_SUPPORT_LIST)) return false;
+    if (!check(params.aLogOptional, "A_log", F32_TYPE_SUPPORT_LIST)) return false;
+    if (!check(params.dtBiasOptional, "dt_bias", F32_TYPE_SUPPORT_LIST)) return false;
+    if (!check(params.numAcceptedTokensOptional, "num_accepted_tokens", INT_TYPE_SUPPORT_LIST)) return false;
     return true;
 }
 
@@ -519,7 +522,10 @@ aclnnStatus DataContiguous(const aclTensor *&tensor, aclOpExecutor *executor)
         return ACLNN_SUCCESS;
     }
     tensor = l0op::Contiguous(tensor, executor);
-    CHECK_RET(tensor != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(tensor == nullptr,
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "DataContiguous/CreateView returned null; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
     return ACLNN_SUCCESS;
 }
 
@@ -540,7 +546,10 @@ aclnnStatus CreateViewIfNonContiguous(const aclTensor *&tensor, aclOpExecutor *e
     const aclTensor *view = executor->CreateView(
         tensor, tensor->GetViewShape(), tensor->GetStorageShape(),
         tensor->GetViewStrides(), tensor->GetViewOffset());
-    CHECK_RET(view != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(view == nullptr,
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "CreateViewIfNonContiguous: CreateView returned null; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
     tensor = view;
     return ACLNN_SUCCESS;
 }
@@ -601,7 +610,10 @@ aclnnStatus NormalizePublishedShapes(RecurrentKdaParams &params, aclOpExecutor *
             }
         }
         tensor = executor->CreateView(tensor, shape, tensor->GetStorageShape(), strides, tensor->GetViewOffset());
-        CHECK_RET(tensor != nullptr, ACLNN_ERR_INNER_NULLPTR);
+        OP_CHECK_IF(tensor == nullptr,
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "DataContiguous/CreateView returned null; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+            return ACLNN_ERR_INNER_NULLPTR);
         return ACLNN_SUCCESS;
     };
     for (auto *tensor : {&params.query, &params.key, &params.value, &params.gate, &params.beta}) {
@@ -643,9 +655,7 @@ void SetInputOriginalShape(RecurrentKdaParams &params)
 aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *executor, bool &synchronized)
 {
     const auto *cu = params.cuSeqlensOptional;
-    if (cu == nullptr || (GetCurrentPlatformInfo().GetSocVersion() != SocVersion::ASCEND950 &&
-                          params.ssmStateIndicesOptional == nullptr))
-        return ACLNN_SUCCESS;
+    if (cu == nullptr) return ACLNN_SUCCESS;
     const int64_t count = cu->GetViewShape().GetDim(0);
     const int64_t stride = cu->GetViewStrides()[0];
     const uint64_t width = cu->GetDataType() == DataType::DT_INT32 ? 4 : 8;
@@ -665,12 +675,16 @@ aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *exec
         std::memcpy(storage.data(), source, bytes);
     } else {
         auto ret = aclrtSynchronizeDevice();
-        CHECK_COND(ret == ACL_SUCCESS, ACLNN_ERR_RUNTIME_ERROR,
-                   "cu_seqlens host value dependency requires device synchronization; runtime status=%d.", ret);
+        OP_CHECK_IF(ret != ACL_SUCCESS,
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "cu_seqlens host value dependency requires device synchronization; runtime status=%d.", ret),
+            return ACLNN_ERR_RUNTIME_ERROR);
         synchronized = true;
         ret = aclrtMemcpy(storage.data(), bytes, source, bytes, ACL_MEMCPY_DEVICE_TO_HOST);
-        CHECK_COND(ret == ACL_SUCCESS, ACLNN_ERR_RUNTIME_ERROR,
-                   "cu_seqlens device-to-host copy failed; bytes=%lu, runtime status=%d.", bytes, ret);
+        OP_CHECK_IF(ret != ACL_SUCCESS,
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "cu_seqlens device-to-host copy failed; bytes=%lu, runtime status=%d.", bytes, ret),
+            return ACLNN_ERR_RUNTIME_ERROR);
     }
     const int64_t capacity = Dim(params.query, 0);
     int64_t previous = 0;
@@ -693,7 +707,10 @@ aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *exec
         previous = current;
     }
     auto *host = executor->AllocHostTensor(cu->GetViewShape(), cu->GetDataType());
-    CHECK_RET(host != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(host == nullptr,
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "AllocHostTensor returned null; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
     auto *destination = static_cast<uint8_t *>(host->GetData());
     for (int64_t i = 0; i < count; ++i)
         std::memcpy(destination + i * width, storage.data() + uint64_t(i) * stride * width, width);
@@ -746,15 +763,20 @@ aclnnStatus SnapshotMetadata(const aclTensor *&tensor, const char *name,
         return ACLNN_ERR_PARAM_INVALID;
     }
     auto *host = executor->AllocHostTensor(tensor->GetViewShape(), tensor->GetDataType());
-    CHECK_RET(host != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(host == nullptr,
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "AllocHostTensor returned null; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
     auto *destination = static_cast<uint8_t *>(host->GetData());
     std::memset(destination, 0, elements * width);
     const auto *source = ViewData(tensor, width);
     const bool onHost = gert::TensorPlacementUtils::IsOnHost(tensor->GetPlacement());
     if (!onHost && !slices.empty() && !synchronized) {
         const auto status = aclrtSynchronizeDevice();
-        CHECK_COND(status == ACL_SUCCESS, ACLNN_ERR_RUNTIME_ERROR,
-                   "State metadata validation requires device synchronization; runtime status=%d.", status);
+        OP_CHECK_IF(status != ACL_SUCCESS,
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "State metadata validation requires device synchronization; runtime status=%d.", status),
+            return ACLNN_ERR_RUNTIME_ERROR);
         synchronized = true;
     }
     for (const auto &slice : slices) {
@@ -765,8 +787,10 @@ aclnnStatus SnapshotMetadata(const aclTensor *&tensor, const char *name,
         else {
             const auto status = aclrtMemcpy(storage.data(), bytes, source + slice.sourceOffset * width,
                                            bytes, ACL_MEMCPY_DEVICE_TO_HOST);
-            CHECK_COND(status == ACL_SUCCESS, ACLNN_ERR_RUNTIME_ERROR,
-                       "State metadata device-to-host copy failed; bytes=%lu, runtime status=%d.", bytes, status);
+            OP_CHECK_IF(status != ACL_SUCCESS,
+                OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                    "State metadata device-to-host copy failed; bytes=%lu, runtime status=%d.", bytes, status),
+                return ACLNN_ERR_RUNTIME_ERROR);
         }
         for (uint64_t i = 0; i < slice.count; ++i)
             std::memcpy(destination + (slice.destinationOffset + i) * width,
@@ -841,15 +865,24 @@ aclnnStatus MaterializeStateMetadata(RecurrentKdaParams &params, aclOpExecutor *
 aclnnStatus CopyStateView(const aclTensor *source, const aclTensor *destination, aclOpExecutor *executor)
 {
     source = l0op::Contiguous(source, executor);
-    CHECK_RET(source != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(source == nullptr,
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "CopyStateView: Contiguous returned null; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
     auto *copySource = executor->CreateView(source, source->GetViewShape(), source->GetViewOffset());
-    CHECK_RET(copySource != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(copySource == nullptr,
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "CopyStateView: CreateView returned null; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
     copySource->SetStorageShape(source->GetViewShape());
     copySource->SetOriginalShape(source->GetViewShape());
     copySource->SetStorageFormat(destination->GetStorageFormat());
     copySource->SetViewFormat(destination->GetViewFormat());
     copySource->SetOriginalFormat(destination->GetOriginalFormat());
-    CHECK_RET(l0op::ViewCopy(copySource, destination, executor) != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(l0op::ViewCopy(copySource, destination, executor) != nullptr),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "l0op::ViewCopy(copySource, destination, executor) != nullptr failed; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
     return ACLNN_SUCCESS;
 }
 
@@ -861,19 +894,54 @@ aclnnStatus PreProcess(
     aclOpExecutor *executor)
 {
     SetInputOriginalShape(params);
-    CHECK_RET(DataContiguousIfNeeded(params.query, queryNeedsContiguous, executor) == ACLNN_SUCCESS,
-              ACLNN_ERR_INNER_NULLPTR);
-    CHECK_RET(DataContiguousIfNeeded(params.key, keyNeedsContiguous, executor) == ACLNN_SUCCESS,
-              ACLNN_ERR_INNER_NULLPTR);
-    CHECK_RET(DataContiguousIfNeeded(params.value, valueNeedsContiguous, executor) == ACLNN_SUCCESS,
-              ACLNN_ERR_INNER_NULLPTR);
-    CHECK_RET(DataContiguous(params.gate, executor) == ACLNN_SUCCESS, ACLNN_ERR_INNER_NULLPTR);
-    CHECK_RET(DataContiguous(params.beta, executor) == ACLNN_SUCCESS, ACLNN_ERR_INNER_NULLPTR);
-    CHECK_RET(DataContiguous(params.cuSeqlensOptional, executor) == ACLNN_SUCCESS, ACLNN_ERR_INNER_NULLPTR);
-    CHECK_RET(DataContiguous(params.ssmStateIndicesOptional, executor) == ACLNN_SUCCESS, ACLNN_ERR_INNER_NULLPTR);
-    CHECK_RET(DataContiguous(params.aLogOptional, executor) == ACLNN_SUCCESS, ACLNN_ERR_INNER_NULLPTR);
-    CHECK_RET(DataContiguous(params.dtBiasOptional, executor) == ACLNN_SUCCESS, ACLNN_ERR_INNER_NULLPTR);
-    CHECK_RET(DataContiguous(params.numAcceptedTokensOptional, executor) == ACLNN_SUCCESS, ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(DataContiguousIfNeeded(params.query, queryNeedsContiguous, executor) == ACLNN_SUCCESS),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "DataContiguousIfNeeded(params.query, queryNeedsContiguous, executor) == ACLNN_SUCCESS "
+            "failed; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(DataContiguousIfNeeded(params.key, keyNeedsContiguous, executor) == ACLNN_SUCCESS),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "DataContiguousIfNeeded(params.key, keyNeedsContiguous, executor) == ACLNN_SUCCESS failed; "
+            "returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(DataContiguousIfNeeded(params.value, valueNeedsContiguous, executor) == ACLNN_SUCCESS),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "DataContiguousIfNeeded(params.value, valueNeedsContiguous, executor) == ACLNN_SUCCESS "
+            "failed; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(DataContiguous(params.gate, executor) == ACLNN_SUCCESS),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "DataContiguous(params.gate, executor) == ACLNN_SUCCESS failed; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(DataContiguous(params.beta, executor) == ACLNN_SUCCESS),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "DataContiguous(params.beta, executor) == ACLNN_SUCCESS failed; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(DataContiguous(params.cuSeqlensOptional, executor) == ACLNN_SUCCESS),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "DataContiguous(params.cuSeqlensOptional, executor) == ACLNN_SUCCESS failed; returning "
+            "status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(DataContiguous(params.ssmStateIndicesOptional, executor) == ACLNN_SUCCESS),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "DataContiguous(params.ssmStateIndicesOptional, executor) == ACLNN_SUCCESS failed; "
+            "returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(DataContiguous(params.aLogOptional, executor) == ACLNN_SUCCESS),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "DataContiguous(params.aLogOptional, executor) == ACLNN_SUCCESS failed; returning "
+            "status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(DataContiguous(params.dtBiasOptional, executor) == ACLNN_SUCCESS),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "DataContiguous(params.dtBiasOptional, executor) == ACLNN_SUCCESS failed; returning "
+            "status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(DataContiguous(params.numAcceptedTokensOptional, executor) == ACLNN_SUCCESS),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "DataContiguous(params.numAcceptedTokensOptional, executor) == ACLNN_SUCCESS failed; "
+            "returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
     if (params.ssmStateIndicesOptional == nullptr && params.numAcceptedTokensOptional != nullptr) {
         ReportInvalid(params, "num_accepted_tokens",
                 "npu_recurrent_kda: num_accepted_tokens requires ssm_state_indices.");
@@ -914,10 +982,13 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     // Device tensor descriptors do not include their values in the L2 cache
     // key. Packed A5 tiling depends on those values and owns a host snapshot,
     // so this path must rebuild instead of returning a cached executor.
-    if (CheckPhase1Params(executor, workspaceSize) != ACLNN_SUCCESS)
-        return ACLNN_ERR_PARAM_NULLPTR;
-    const bool valueDependent = ssmStateIndicesOptional != nullptr ||
-        (cuSeqlensOptional != nullptr && GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND950);
+    OP_CHECK_IF(executor == nullptr,
+        OP_LOGE_WITH_INVALID_INPUT("aclnnRecurrentKdaGetWorkspaceSize", "executor"),
+        return ACLNN_ERR_PARAM_NULLPTR);
+    OP_CHECK_IF(workspaceSize == nullptr,
+        OP_LOGE_WITH_INVALID_INPUT("aclnnRecurrentKdaGetWorkspaceSize", "workspaceSize"),
+        return ACLNN_ERR_PARAM_NULLPTR);
+    const bool valueDependent = ssmStateIndicesOptional != nullptr || cuSeqlensOptional != nullptr;
     L2_DFX_PHASE_1_WITHOUT_CACHE(aclnnRecurrentKda,
                    DFX_IN(query, key, value, gate, beta, initialStateRef, cuSeqlensOptional,
                           ssmStateIndicesOptional, aLogOptional, dtBiasOptional, numAcceptedTokensOptional,
@@ -936,7 +1007,10 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     }
 
     auto uniqueExecutor = CREATE_EXECUTOR();
-    CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
+    OP_CHECK_IF(!(uniqueExecutor.get() != nullptr),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "uniqueExecutor.get() != nullptr failed; returning status=%d.", ACLNN_ERR_INNER_CREATE_EXECUTOR),
+        return ACLNN_ERR_INNER_CREATE_EXECUTOR);
     auto executorPtr = uniqueExecutor.get();
     if (valueDependent) executorPtr->AbandonCache();
 
@@ -952,19 +1026,19 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
         params.safeGate = false;
         params.lowerBound = -5.0;
     }
-    CHECK_RET(CheckNotNull(params), ACLNN_ERR_PARAM_INVALID);
-    CHECK_RET(CheckDtypeValid(params), ACLNN_ERR_PARAM_INVALID);
+    if (!CheckNotNull(params)) return ACLNN_ERR_PARAM_INVALID;
+    if (!CheckDtypeValid(params)) return ACLNN_ERR_PARAM_INVALID;
     const auto normalizeStatus = NormalizePublishedShapes(params, executorPtr);
     if (normalizeStatus != ACLNN_SUCCESS) return normalizeStatus;
     // `cu_seqlens` is the only mode discriminator.  `layout` remains a
     // compatibility argument and does not affect rank or address semantics.
     const bool varlen = params.cuSeqlensOptional != nullptr;
     const RecurrentKdaLayout parsedLayout = varlen ? RecurrentKdaLayout::TND : RecurrentKdaLayout::BSND;
-    CHECK_RET(CheckShape(params, varlen), ACLNN_ERR_PARAM_INVALID);
-    CHECK_RET(CheckQkvMaterializationSafety(params.query, parsedLayout, "query") &&
-                  CheckQkvMaterializationSafety(params.key, parsedLayout, "key") &&
-                  CheckQkvMaterializationSafety(params.value, parsedLayout, "value"),
-              ACLNN_ERR_PARAM_INVALID);
+    if (!CheckShape(params, varlen)) return ACLNN_ERR_PARAM_INVALID;
+    if (!CheckQkvMaterializationSafety(params.query, parsedLayout, "query") ||
+        !CheckQkvMaterializationSafety(params.key, parsedLayout, "key") ||
+        !CheckQkvMaterializationSafety(params.value, parsedLayout, "value"))
+        return ACLNN_ERR_PARAM_INVALID;
     const bool querySupportsDirect = IsSupportedQkvView(params.query, parsedLayout);
     const bool keySupportsDirect = IsSupportedQkvView(params.key, parsedLayout);
     const bool valueSupportsDirect = IsSupportedQkvView(params.value, parsedLayout);
@@ -979,17 +1053,32 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     if (cuStatus != ACLNN_SUCCESS) return cuStatus;
     const auto metadataStatus = MaterializeStateMetadata(params, executorPtr, metadataSynchronized);
     if (metadataStatus != ACLNN_SUCCESS) return metadataStatus;
-    CHECK_RET(PreProcess(params, queryNeedsContiguous, keyNeedsContiguous, valueNeedsContiguous, executorPtr) ==
-                  ACLNN_SUCCESS,
-              ACLNN_ERR_PARAM_INVALID);
+    OP_CHECK_IF(!(PreProcess(params, queryNeedsContiguous, keyNeedsContiguous, valueNeedsContiguous, executorPtr) ==
+        ACLNN_SUCCESS),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "PreProcess(params, queryNeedsContiguous, keyNeedsContiguous, valueNeedsContiguous, "
+            "executorPtr) == ACLNN_SUCCESS failed; returning status=%d.", ACLNN_ERR_PARAM_INVALID),
+        return ACLNN_ERR_PARAM_INVALID);
     if (queryUsesDirectView) {
-        CHECK_RET(CreateViewIfNonContiguous(params.query, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_INNER_NULLPTR);
+        OP_CHECK_IF(!(CreateViewIfNonContiguous(params.query, executorPtr) == ACLNN_SUCCESS),
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "CreateViewIfNonContiguous(params.query, executorPtr) == ACLNN_SUCCESS failed; returning "
+                "status=%d.", ACLNN_ERR_INNER_NULLPTR),
+            return ACLNN_ERR_INNER_NULLPTR);
     }
     if (keyUsesDirectView) {
-        CHECK_RET(CreateViewIfNonContiguous(params.key, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_INNER_NULLPTR);
+        OP_CHECK_IF(!(CreateViewIfNonContiguous(params.key, executorPtr) == ACLNN_SUCCESS),
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "CreateViewIfNonContiguous(params.key, executorPtr) == ACLNN_SUCCESS failed; returning "
+                "status=%d.", ACLNN_ERR_INNER_NULLPTR),
+            return ACLNN_ERR_INNER_NULLPTR);
     }
     if (valueUsesDirectView) {
-        CHECK_RET(CreateViewIfNonContiguous(params.value, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_INNER_NULLPTR);
+        OP_CHECK_IF(!(CreateViewIfNonContiguous(params.value, executorPtr) == ACLNN_SUCCESS),
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "CreateViewIfNonContiguous(params.value, executorPtr) == ACLNN_SUCCESS failed; returning "
+                "status=%d.", ACLNN_ERR_INNER_NULLPTR),
+            return ACLNN_ERR_INNER_NULLPTR);
     }
 
     aclTensor *initialStateForKernel = params.initialStateRef;
@@ -1000,7 +1089,10 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
             initialStateForKernel->GetStorageShape(),
             initialStateForKernel->GetViewStrides(),
             initialStateForKernel->GetViewOffset());
-        CHECK_RET(initialStateForKernel != nullptr, ACLNN_ERR_INNER_NULLPTR);
+        OP_CHECK_IF(initialStateForKernel == nullptr,
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "initialStateRef: CreateView returned null; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+            return ACLNN_ERR_INNER_NULLPTR);
     }
     const aclTensor *finalStateForKernel = params.finalState;
     if (!IsContiguous(finalStateForKernel)) {
@@ -1010,7 +1102,10 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
             finalStateForKernel->GetStorageShape(),
             finalStateForKernel->GetViewStrides(),
             finalStateForKernel->GetViewOffset());
-        CHECK_RET(finalStateForKernel != nullptr, ACLNN_ERR_INNER_NULLPTR);
+        OP_CHECK_IF(finalStateForKernel == nullptr,
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "finalState: CreateView returned null; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+            return ACLNN_ERR_INNER_NULLPTR);
     }
 
     // Empty requests and untouched pool slots must preserve their initial value
@@ -1025,8 +1120,11 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     }
     if (!params.inplaceFinalState && params.outputFinalState &&
         !SameTensorView(params.initialStateRef, params.finalState)) {
-        CHECK_RET(CopyStateView(initialStateForKernel, finalStateForKernel, executorPtr) == ACLNN_SUCCESS,
-                  ACLNN_ERR_INNER_NULLPTR);
+        OP_CHECK_IF(!(CopyStateView(initialStateForKernel, finalStateForKernel, executorPtr) == ACLNN_SUCCESS),
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "CopyStateView(initialStateForKernel, finalStateForKernel, executorPtr) == ACLNN_SUCCESS "
+                "failed; returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+            return ACLNN_ERR_INNER_NULLPTR);
     }
     auto result = l0op::RecurrentKda(
         params.query, params.key, params.value, params.gate, params.beta, initialStateForKernel,
@@ -1037,12 +1135,18 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
         params.aLogOptional != nullptr, params.useBetaSigmoidInKernel, params.allowNegEigval,
         params.safeGate, params.lowerBound, params.stateVFirst, params.attnOut,
         finalStateForKernel, executorPtr);
-    CHECK_RET(result[0] != nullptr && result[1] != nullptr && result[2] != nullptr,
-              ACLNN_ERR_INNER_NULLPTR);
+    OP_CHECK_IF(!(result[0] != nullptr && result[1] != nullptr && result[2] != nullptr),
+        OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+            "result[0] != nullptr && result[1] != nullptr && result[2] != nullptr failed; returning "
+            "status=%d.", ACLNN_ERR_INNER_NULLPTR),
+        return ACLNN_ERR_INNER_NULLPTR);
     if (params.inplaceFinalState && params.outputFinalState &&
         !SameTensorView(params.finalState, params.initialStateRef)) {
-        CHECK_RET(CopyStateView(result[1], finalStateForKernel, executorPtr) == ACLNN_SUCCESS,
-                  ACLNN_ERR_INNER_NULLPTR);
+        OP_CHECK_IF(!(CopyStateView(result[1], finalStateForKernel, executorPtr) == ACLNN_SUCCESS),
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "CopyStateView(result[1], finalStateForKernel, executorPtr) == ACLNN_SUCCESS failed; "
+                "returning status=%d.", ACLNN_ERR_INNER_NULLPTR),
+            return ACLNN_ERR_INNER_NULLPTR);
     }
 
     *workspaceSize = uniqueExecutor->GetWorkspaceSize();

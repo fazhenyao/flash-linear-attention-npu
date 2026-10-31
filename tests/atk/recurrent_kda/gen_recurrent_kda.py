@@ -226,6 +226,10 @@ def generate_packages():
             dict(name="key0_no_bias", B=16, T=17, dt_bias_none=True,
                  use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
                  use_beta_sigmoid_in_kernel=True),
+            dict(name="key0_bf16_x1_general", T=1, state_dtype="bf16", inplace=True),
+            dict(name="key0_bf16_x1_fused", T=1, state_dtype="bf16", inplace=True,
+                 use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+                 use_beta_sigmoid_in_kernel=True),
         ]],
     }
     from copy import deepcopy

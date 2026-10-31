@@ -215,6 +215,9 @@ def main():
                 python_guard = backend == "ctypes" and (invalid in ("head_ratio", "q_dtype") or invalid.startswith("lower_"))
                 if not python_guard:
                     assert "161002" in message, (backend, invalid, message)
+                    expected_code = "EZ0020" if invalid == "q_dtype" else "EZ0037"
+                    assert expected_code in message, (backend, invalid, message)
+                    assert not any(code in message for code in ("EZ9999", "EZ9903", "EZ1001")), message
                 if invalid.startswith("cu_"):
                     assert all(text in message for text in ("EZ0037", "index=", "actual=", "capacity=2")), message
                 rejected += 1

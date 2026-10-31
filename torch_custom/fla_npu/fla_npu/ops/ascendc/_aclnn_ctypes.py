@@ -4442,7 +4442,7 @@ def npu_recurrent_kda(
     state_v_first=False,
 ):
     import torch
-    from ._recurrent_kda_compat import normalize_inputs
+    from ._recurrent_kda_compat import normalize_inputs, wait_for_metadata
 
     q, k, v, g, beta, output_shape = normalize_inputs(q, k, v, g, beta, cu_seqlens)
 
@@ -4619,6 +4619,7 @@ def npu_recurrent_kda(
             ctx.tensor(final_state_arg, "final_state"),
         ]
 
+    wait_for_metadata(q, cu_seqlens, ssm_state_indices)
     _call_aclnn(
         "aclnnRecurrentKda",
         build_args,

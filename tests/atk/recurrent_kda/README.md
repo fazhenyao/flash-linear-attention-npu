@@ -10,7 +10,7 @@
 - `q/k/v/out` 为 BF16；`g/beta` 支持 FP32/BF16/FP16，State 支持 FP32/BF16。传入 `A_log` 时 g 为 raw gate；不传时 g 为 step log gate，并忽略 `dt_bias/safe_gate/lower_bound`。兼容参数 `use_gate_in_kernel` 不决定数值路径。
 - `HV % H == 0`，没有 H/HV<=256 或 G<=16 的人为限制，仍受地址、DMA stride 和 tiling 字段范围约束。A5 支持 K=V=128；A2/A3 保留 K=128、V=128/256 的硬件路径。
 - A5 不限制每段长度为8。显式 `ssm_state_indices` 可使 `state_capacity > seq_num`。Q/K/V 支持独立的合法 batch stride。
-- A2/A3 共用模式与 gate 参数语义；本轮未完成这两类设备的运行验证，不能以 A5 结果替代。
+- A2/A3 共用模式与 gate 参数语义；2026-10-31 的 A2 上板冒烟未通过，见文末记录。A3 尚未上板，不能以 A5 结果替代。
 
 ## 标杆来源
 
@@ -53,13 +53,13 @@ bash tests/atk/run_test_cpu.sh -op=recurrent_kda -scope=gen_cases
 | --- | --- | --- |
 | `atk_recurrent_kda.json` | 44结构×3种子=132 | 原有小 shape；8融合开关组合；长序列、布局、dtype、state、slot及边界 |
 | `atk_recurrent_kda_perf.json` | issue 的36组模型 shape | B=32/64/72，HK=16，HV=32/48/128，T=1/2/4/8，K=V=128 |
-| `atk_recurrent_kda_mss.json` | 人工选择9组，全部 key=0 | short/window/tail/transpose/slots/packed/fallback/独立 batch stride |
+| `atk_recurrent_kda_mss.json` | 人工选择11组，全部 key=0 | short/window/tail/transpose/slots/packed/fallback/独立 batch stride；补充 X=1 BF16 fused/general 两遍读取 |
 
 精度覆盖每段长度1/2/4/8/9/15/16/17/31/32/33/65/129/257/1024，HV/HK=1/2/3/16；
 全零/小范数/强信号；safe/unsafe gate、大 raw gate、beta负特征值开关；融合 QKV storage
 offset、head gap、feature stride=2回退；非连续 state、两种布局/dtype、原位/非原位；
 无 metadata、空初始 state、空序列/padding；跨窗口重复 slot、accepted token 与未命中槽。
-算子只有 key=0，host 不新增 key；9个 MSS case 覆盖当前窗口与缓冲分支。
+算子只有 key=0，host 不新增 key；11个 MSS case 覆盖当前窗口与缓冲分支，包括 X=1 BF16 fused/general。
 
 以下原有执行次数和基线说明属于历史验收记录；本轮采样与基线见文末 2026-10-29 方案对齐记录。
 
@@ -700,3 +700,36 @@ A5_1物理卡4/逻辑0，同卡串行msprof，远程main为2bb7e74ecf4876acbc452
 最大组内CV2.50%，相对整改前最大单例增加1.07%；设备经授权共享，三版各288次前后查询都观察到其他进程，无查询失败，不宣称独占设备结果或所有小差异显著。小规模有/无indices端到端补测波动很大（最大CV139.66%），只保留原样本，不据此量化host成本；索引校验新增同步/D2H和快照开销，无indices模型路径不增加该步骤。
 
 192项issue/21规则覆盖通过；静态扫描仍有已分类的内部故障/叶子传播及文档误匹配，未宣称零发现。当前对象未重跑历史确定性、sanitizer或simulator，A2/A3、整体Example/ST与正式CI未执行。完整逐case表、方法、命令及限制见[二轮整改记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-review-r2-fixes-20261030.md)。私有证据zip共687文件，CRC和逐文件SHA256均通过，包SHA256为`96cc8c88fab4312b5b0d5bfd9a6f77070cd8588959df2424f3402a9a9680202e`。开发期validation记录已归并删除。
+
+## 2026-10-31 PR #997 当前提交 A2 上板失败记录
+
+被测提交 `be0ecad8a739de5b205d1a229058d58d2407a89d`，A2 910B3 物理卡4，CANN 9.3.0 weekly、torch/torch_npu 2.9.1、ATK 26.9.8。独立 venv 标准 wheel 构建安装及 libcust_opapi、72 个 kernel 对象核对通过，未修改算子实现和冻结方案。
+
+`B=2,T=9,H=1,HV=2,K=128`，V=128/256 × V-first/K-first × State FP32/BF16 的8例冒烟全部触发 `507035 / vector core exception`，设备报 Scalar 地址异常，部分用例同时明确报 Vector UB 越界。普通 T=2 的原有第0例也复现。ATK 异常路径返回0不代表通过；本轮无有效 out/State 精度比较结果，未继续完整精度、公开接口、确定性、sanitizer 或性能采集，正式验收结论为未通过。
+
+确认 A2 host 固定 UB 预算只计算一槽 packed 输入，而 generic kernel 实际分配两槽，K=V=128 时少算10 KiB。T=2 的实际 tiling 数值对应总分配204160 B，超过可用196352 B；修复后尚未重测，不能断言这是所有异常的唯一原因。完整复现、逐路径错误和资源账本见[A2 测试记录](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-a2-test-20261031.md)。私有证据79文件的CRC及SHA256全部核验通过。A3未上板；本轮未提交或推送PR。
+
+## 2026-10-31 A2 UB 修复与 A5 X=1 两遍读取
+
+先 rebase 到远程 main `34851b76`，原6个提交等价重放，head `c7af2aaa`。A2 host 恢复双槽 packed 预算、实际 NV 的 beta/窗口预算及 tmpBytes 容量检查。标准完整 wheel 重建安装后，原失败8例、234例正式精度和17例各3轮确定性均通过；out/State 精度字段逐项为 true。A2 无 indices 的非法 cu_seqlens 仍未被公开入口拒绝，两项扩展脚本失败于 cu_start；不宣称所有公开契约通过。见[A2复验](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-a2-test-20261031.md)。
+
+按用户选择将 A5 V-first X=1 fused/general 分派也切换为两遍 State 读取，与已验收候选逐字一致。186项原精度通过；A5_1物理卡5用 msprof 对 issue680 全36形状、四路径采集144组，每组3预热、5正式，所有样本保留。V-first T=1的9例耗时比几何均值：FP32 -4.33%、BF16 -6.66%；最差分别为 ID28 +3.51%、ID20 +1.04%。其余路径为控制组，设备有其他任务共享，不能把所有小差异解释为优化收益。完整方法、逐case均值与限制见[X=1两遍复验](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-x1-two-pass-20261031.md)。
+
+## 2026-10-31 PR #997 最终检视与双平台验收
+
+本节取代上节“无 indices CU 尚未拒绝”的中间结论；历史失败保留。按最新 main 的 operator-review skill 修复 A2/A3 实际双槽及 scratch 预算、所有平台 CU 值校验/缓存、host opbase 报错接口，并补齐 Python 元数据生产者就绪依赖。冻结方案未修改，公开签名与已发布 tag 一致；layout/gate 的用户确认语义及旧 shape 迁移别名保留。
+
+| 项目 | A5（A5_1，物理卡5） | A2（物理卡4） |
+| --- | --- | --- |
+| CPU 双输出精度 | 188/188（186+2项 X=1 BF16） | 234/234 |
+| 确定性 | 11项，各50轮 | 17项，各50轮 |
+| 插桩 memcheck | 11项，无错误 | 17项，无错误 |
+| 公开契约与 mutation/grad | 74项 | 74项 |
+| 三入口扩展 | 59正常、49负向 | 59正常、49负向 |
+| 元数据就绪专项 | 20项 | 20项 |
+
+两平台分别标准构建并核对安装产物。memcheck 使用独立 sanitizer wheel，72条设备编译命令和72个插桩对象均核验；未以正常构建替代。元数据专项 `python tests/atk/recurrent_kda/scripts/check_metadata_readiness.py --device 0` 在默认和独立 stream 中不手工预同步，覆盖 stable/ctypes 正常双输出及非法 accepted/CU；随后再次运行公开契约和三入口回归。
+
+A5 用 msprof 对最新 main `34851b76` 与 PR 采集 issue680 全36形状×四路径，每组3预热、5正式。首轮 PR/main 耗时比几何均值：V-first BF16 0.761890、V-first FP32 0.690407、K-first BF16 0.422191、K-first FP32 0.351471。main 的7组 V-first FP32 噪声较大，反序复核后最大 CV 0.74%；29组首轮加7组复核的诊断汇总为0.708479。原样本全部保留；这不是第二轮完整144组对比，也不是端到端调用耗时。
+
+详见[最终检视验收](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-pr-review-acceptance-20261031.md)和[36形状分路径性能](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-upstream-final-compare-20261031.md)。A3、整体 Example/ST、正式 NPU CI 及内部故障注入未执行。

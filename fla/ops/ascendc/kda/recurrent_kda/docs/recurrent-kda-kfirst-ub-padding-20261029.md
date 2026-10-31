@@ -121,7 +121,7 @@ V-first 完整短请求仿真由7.259增至9.225 μs，说明不能仅凭其 UB 
 
 实现涉及 `op_kernel/arch35/recurrent_kda_regbase.h`、`recurrent_kda_pipeline.h`、`op_kernel/recurrent_kda.cpp` 和 host 的 `recurrent_kda_tiling_processor.h`。公开接口、tiling data ABI、CPU 标杆及必要同步均未修改；本轮未做 A2/A3 上板测试。
 
-- 本地结果根：`D:/PROJECT/flash-linear-attention-npu/output/rkda-kfirst-ub-padding-20261029`。
+- 本地结果根：`output/rkda-kfirst-ub-padding-20261029`。
 - 远程结果根：`<run-root>/rkda-kfirst-ub-padding-20261029`，包含源码、标准 run 包、独立 venv、完整 profiling 目录与正式报告。
 - `performance-summary.json`：逐 case 样本、均值、比例、异常原始组与重测组；`before/after.csv` 及 `before/after-retry31.csv` 为原始 msprof 表。
 - `simulator-summary.json`、六份 `*-trace.json` 和 `*-binding.json`：指令耗时与二进制身份；`state-padding-pipeline.png/svg` 为中文流水图。

@@ -604,7 +604,7 @@ def npu_recurrent_kda(
 
     # Stable ABI still carries an integer slot for the legacy attribute, but
     # the recurrent kernel ignores its value.
-    from ._recurrent_kda_compat import normalize_inputs
+    from ._recurrent_kda_compat import normalize_inputs, wait_for_metadata
 
     q, k, v, g, beta, output_shape = normalize_inputs(q, k, v, g, beta, cu_seqlens)
     layout_code = 0
@@ -657,6 +657,7 @@ def npu_recurrent_kda(
     op = _OP_CACHE.get("npu_recurrent_kda")
     if op is None:
         op = _op("npu_recurrent_kda")
+    wait_for_metadata(q, cu_seqlens, ssm_state_indices)
     out, final_state = op(
         q,
         k,
