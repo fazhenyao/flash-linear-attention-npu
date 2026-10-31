@@ -168,3 +168,7 @@ A3、整体 Example/ST、旧 CANN 版本和正式 NPU CI 未执行。Runtime/all
 | a2-review-evidence.zip | 40 | `c842669f84a8b6d7e7a40cb7938c645123fe21dd06f799da7e0c6171be1afc51` |
 
 计时 CSV、输入 manifest、库/设备对象身份、正常与插桩报告、失败历史及最终 Python helper 的安装 SHA 分别保留。完整 tensor 输出留在远程任务目录；压缩归档不复制这些大文件。最后新增的 Python 等待与已采集设备对象无关，最终三文件源码/安装归一化 SHA 已匹配。
+
+## 后续检视意见
+
+本记录的全量验收对应 `ecc69ea6`。随后针对 discussion_r4430769129 移除元数据显式全设备同步；增量验收、未采用候选、12组四路径 kernel 对照及多流/连续调用结果见[同步修复](recurrent-kda-metadata-stream-fix-20261031.md)。新一轮未重复完整矩阵和 sanitizer，设备对象身份保持一致；两轮证据分开保留。

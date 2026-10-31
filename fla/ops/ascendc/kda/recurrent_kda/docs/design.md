@@ -12,6 +12,7 @@ A5 单 Vector Stage 按 tile → token 执行。V-first以四个V行的归约结
 
 所有平台的 packed 调用都在 host 校验 cu_seqlens 的首项、单调性和容量，保留 executor 自有快照，并禁用旧 executor 缓存。A2/A3 的无 indices packed 路径也执行该校验，因此新增必要的 host 同步/D2H；固定长度且无 indices 不增加此开销。A5 还用快照计算最大有效长度及 X。
 Python stable/ctypes 入口在 CU/indices 存在时先等待当前 PyTorch NPU stream，补足框架生产者到 ACLNN host 快照的就绪依赖。该处理局限于 recurrent_kda，不修改公共 runtime；固定长度且无 indices 不等待。直接 ACLNN 的元数据就绪责任由调用方承担，详见 API。
+Host 元数据读取按[全设备同步修复](recurrent-kda-metadata-stream-fix-20261031.md)在生产者已就绪的前提下使用同步 D2H，移除算子中的全设备同步，不新增 stream、event 或 pinned staging 的逐调用分配。CU、活跃 indices/accepted 的快照所有权和实际值校验不变。runtime 同步复制的跨流行为以 A5 实测记录为准，不将其扩展为所有 CANN 版本的保证。值依赖缓存继续禁用，不能让同 descriptor 的元数据变更复用旧快照。
 
 A2/A3 共用序列模式、gate 选择及 inactive raw-gate 参数忽略规则，保留对应硬件计算与资源路径；A5 的计算分组、三 bank 容量及 X 预算不套用于 A2/A3。
 

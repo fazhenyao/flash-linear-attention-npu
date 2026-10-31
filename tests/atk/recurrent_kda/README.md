@@ -733,3 +733,13 @@ A5_1物理卡4/逻辑0，同卡串行msprof，远程main为2bb7e74ecf4876acbc452
 A5 用 msprof 对最新 main `34851b76` 与 PR 采集 issue680 全36形状×四路径，每组3预热、5正式。首轮 PR/main 耗时比几何均值：V-first BF16 0.761890、V-first FP32 0.690407、K-first BF16 0.422191、K-first FP32 0.351471。main 的7组 V-first FP32 噪声较大，反序复核后最大 CV 0.74%；29组首轮加7组复核的诊断汇总为0.708479。原样本全部保留；这不是第二轮完整144组对比，也不是端到端调用耗时。
 
 详见[最终检视验收](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-pr-review-acceptance-20261031.md)和[36形状分路径性能](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-upstream-final-compare-20261031.md)。A3、整体 Example/ST、正式 NPU CI 及内部故障注入未执行。
+
+## 2026-10-31 新检视意见：移除元数据全设备同步
+
+针对 PR #997 discussion_r4430769129，在调用方元数据就绪契约下移除 CU 和 indices/accepted 读取前的显式全设备同步，保留同步 D2H、活跃值校验、executor 快照和必要的值依赖缓存禁用。Python 仍等待自己的当前 stream，原始 ACLNN 回归显式保证生产者就绪；不是直接删除生产消费依赖。
+
+A5/A2 各重新通过20项元数据就绪、74项公开契约、59正常/49负向三入口回归，以及16项具体 EZ 码和拒绝后4条 CPU 健康路径。两平台各72个设备对象与旧对照一致，本轮未重跑完整188/234项矩阵和 sanitizer，前节完整验收属于修改前版本，不能混为新一轮全量结果。
+
+A5 同卡 msprof 对 issue680 ID0/7/35 × 四路径，每组3预热、5正式；12组耗时比几何均值0.997326，最大组内 CV 2.59%，设备计算无实质变化。额外测量8次连续 decode、两个独立 head stream 的调用链时间，并以无关 stream 的128次4096×4096 FP16 matmul 验证隔离。反序控制中，修改前5次返回时无关工作均完成、enqueue 47.207–57.724 ms；修改后5次返回时均未完成、enqueue 0.431–1.827 ms。微小负载双 head 仍有 host 调度开销和波动，未宣称所有端到端场景稳定加速。
+
+最终方案、未采用的独立 stream 候选、完整12组 kernel 和调用链表、两轮原样本及统计限制见[元数据同步修复](../../../fla/ops/ascendc/kda/recurrent_kda/docs/recurrent-kda-metadata-stream-fix-20261031.md)。新增复现入口为 `scripts/check_metadata_stream_perf.py`，此脚本的 host/E2E 统计不替代 msprof kernel 耗时。

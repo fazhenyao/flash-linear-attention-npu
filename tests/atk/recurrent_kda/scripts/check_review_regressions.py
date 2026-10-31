@@ -39,6 +39,9 @@ def direct_aclnn(q, k, v, g, beta, initial_state, **options):
                 ctypes.c_bool(options["state_v_first"]), ctx.tensor(out, "attn_out"),
                 ctx.tensor(final, "final_state")]
 
+    # Raw GetWorkspaceSize has no producer-stream argument. Fulfil its
+    # metadata-ready precondition; wrapper-specific tests omit this wait.
+    torch.npu.current_stream(q.device).synchronize()
     _aclnn_ctypes._call_aclnn("aclnnRecurrentKda", arguments, (out, initial_state, final))
     torch.npu.synchronize()
     assert torch.all(storage[:16] == 17) and torch.all(storage[-16:] == 17)

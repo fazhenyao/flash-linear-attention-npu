@@ -8,3 +8,5 @@
 - issue680 全36形状、四路径的最新 main 对比见[性能记录](recurrent-kda-upstream-final-compare-20261031.md)。
 
 原始失败和中间修复历史见[A2记录](recurrent-kda-a2-test-20261031.md)、[host 报错记录](recurrent-kda-host-error-reporting-20261031.md)和[X=1两遍读取记录](recurrent-kda-x1-two-pass-20261031.md)。本地验收不替代正式 NPU CI；A3 和内部故障注入未覆盖。
+
+后续显式全设备同步修复的增量回归、多流隔离及性能见[元数据同步修复](recurrent-kda-metadata-stream-fix-20261031.md)。前述完整矩阵属于 `ecc69ea6`；本轮只重跑报告列出的增量项目，设备对象保持一致。

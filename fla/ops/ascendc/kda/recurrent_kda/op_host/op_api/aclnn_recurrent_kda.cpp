@@ -649,10 +649,23 @@ void SetInputOriginalShape(RecurrentKdaParams &params)
     SetTensorOriginalShape(params.numAcceptedTokensOptional);
 }
 
-// The public ABI accepts a device Tensor, whereas value-dependent tiling needs
-// host data. Workspace creation has no stream argument: synchronize before D2H,
-// then give the executor an owned host constant (also copied to GM for kernel use).
-aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *executor, bool &synchronized)
+// GetWorkspaceSize has no producer-stream argument. Device metadata must be
+// ready on entry (Python waits its framework stream). A synchronous D2H waits
+// for this copy; do not add a device-wide producer barrier here.
+class MetadataTransfer {
+public:
+    aclnnStatus Copy(void *destination, const void *source, uint64_t bytes, const char *name) const
+    {
+        const auto ret = aclrtMemcpy(destination, bytes, source, bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+        OP_CHECK_IF(ret != ACL_SUCCESS,
+            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
+                "D2H for %s metadata failed; bytes=%lu, runtime status=%d.", name, bytes, ret),
+            return ACLNN_ERR_RUNTIME_ERROR);
+        return ACLNN_SUCCESS;
+    }
+};
+
+aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *executor, MetadataTransfer &transfer)
 {
     const auto *cu = params.cuSeqlensOptional;
     if (cu == nullptr) return ACLNN_SUCCESS;
@@ -674,17 +687,8 @@ aclnnStatus MaterializeCuSeqlens(RecurrentKdaParams &params, aclOpExecutor *exec
     if (gert::TensorPlacementUtils::IsOnHost(cu->GetPlacement())) {
         std::memcpy(storage.data(), source, bytes);
     } else {
-        auto ret = aclrtSynchronizeDevice();
-        OP_CHECK_IF(ret != ACL_SUCCESS,
-            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
-                "cu_seqlens host value dependency requires device synchronization; runtime status=%d.", ret),
-            return ACLNN_ERR_RUNTIME_ERROR);
-        synchronized = true;
-        ret = aclrtMemcpy(storage.data(), bytes, source, bytes, ACL_MEMCPY_DEVICE_TO_HOST);
-        OP_CHECK_IF(ret != ACL_SUCCESS,
-            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
-                "cu_seqlens device-to-host copy failed; bytes=%lu, runtime status=%d.", bytes, ret),
-            return ACLNN_ERR_RUNTIME_ERROR);
+        const auto status = transfer.Copy(storage.data(), source, bytes, "cu_seqlens");
+        if (status != ACLNN_SUCCESS) return status;
     }
     const int64_t capacity = Dim(params.query, 0);
     int64_t previous = 0;
@@ -739,7 +743,7 @@ int64_t IntegerMetadataValue(const aclTensor *tensor, uint64_t index)
 
 aclnnStatus SnapshotMetadata(const aclTensor *&tensor, const char *name,
                             const std::vector<MetadataSlice> &slices,
-                            aclOpExecutor *executor, bool &synchronized)
+                            aclOpExecutor *executor, MetadataTransfer &transfer)
 {
     if (tensor == nullptr) return ACLNN_SUCCESS;
     const uint64_t width = tensor->GetDataType() == DataType::DT_INT32 ? 4 : 8;
@@ -771,26 +775,14 @@ aclnnStatus SnapshotMetadata(const aclTensor *&tensor, const char *name,
     std::memset(destination, 0, elements * width);
     const auto *source = ViewData(tensor, width);
     const bool onHost = gert::TensorPlacementUtils::IsOnHost(tensor->GetPlacement());
-    if (!onHost && !slices.empty() && !synchronized) {
-        const auto status = aclrtSynchronizeDevice();
-        OP_CHECK_IF(status != ACL_SUCCESS,
-            OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
-                "State metadata validation requires device synchronization; runtime status=%d.", status),
-            return ACLNN_ERR_RUNTIME_ERROR);
-        synchronized = true;
-    }
     for (const auto &slice : slices) {
         if (slice.count == 0) continue;
         const uint64_t bytes = ((slice.count - 1) * slice.stride + 1) * width;
         std::vector<uint8_t> storage(bytes);
         if (onHost) std::memcpy(storage.data(), source + slice.sourceOffset * width, bytes);
         else {
-            const auto status = aclrtMemcpy(storage.data(), bytes, source + slice.sourceOffset * width,
-                                           bytes, ACL_MEMCPY_DEVICE_TO_HOST);
-            OP_CHECK_IF(status != ACL_SUCCESS,
-                OP_LOGE_LIBOPAPI_REPORT("aclnnRecurrentKda",
-                    "State metadata device-to-host copy failed; bytes=%lu, runtime status=%d.", bytes, status),
-                return ACLNN_ERR_RUNTIME_ERROR);
+            const auto status = transfer.Copy(storage.data(), source + slice.sourceOffset * width, bytes, name);
+            if (status != ACLNN_SUCCESS) return status;
         }
         for (uint64_t i = 0; i < slice.count; ++i)
             std::memcpy(destination + (slice.destinationOffset + i) * width,
@@ -800,7 +792,7 @@ aclnnStatus SnapshotMetadata(const aclTensor *&tensor, const char *name,
     return ACLNN_SUCCESS;
 }
 
-aclnnStatus MaterializeStateMetadata(RecurrentKdaParams &params, aclOpExecutor *executor, bool &synchronized)
+aclnnStatus MaterializeStateMetadata(RecurrentKdaParams &params, aclOpExecutor *executor, MetadataTransfer &transfer)
 {
     const auto *indices = params.ssmStateIndicesOptional;
     if (indices == nullptr) return ACLNN_SUCCESS;
@@ -831,10 +823,10 @@ aclnnStatus MaterializeStateMetadata(RecurrentKdaParams &params, aclOpExecutor *
                                       uint64_t(b), 1, 1});
     }
     auto status = SnapshotMetadata(params.ssmStateIndicesOptional, "ssm_state_indices", indexSlices,
-                                   executor, synchronized);
+                                   executor, transfer);
     if (status != ACLNN_SUCCESS) return status;
     status = SnapshotMetadata(params.numAcceptedTokensOptional, "num_accepted_tokens", acceptedSlices,
-                              executor, synchronized);
+                              executor, transfer);
     if (status != ACLNN_SUCCESS) return status;
     const int64_t capacity = Dim(params.initialStateRef, 0);
     for (int64_t b = 0; b < requests; ++b) {
@@ -1048,10 +1040,10 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     const bool queryNeedsContiguous = !querySupportsDirect;
     const bool keyNeedsContiguous = !keySupportsDirect;
     const bool valueNeedsContiguous = !valueSupportsDirect;
-    bool metadataSynchronized = false;
-    const auto cuStatus = MaterializeCuSeqlens(params, executorPtr, metadataSynchronized);
+    MetadataTransfer metadataTransfer;
+    const auto cuStatus = MaterializeCuSeqlens(params, executorPtr, metadataTransfer);
     if (cuStatus != ACLNN_SUCCESS) return cuStatus;
-    const auto metadataStatus = MaterializeStateMetadata(params, executorPtr, metadataSynchronized);
+    const auto metadataStatus = MaterializeStateMetadata(params, executorPtr, metadataTransfer);
     if (metadataStatus != ACLNN_SUCCESS) return metadataStatus;
     OP_CHECK_IF(!(PreProcess(params, queryNeedsContiguous, keyNeedsContiguous, valueNeedsContiguous, executorPtr) ==
         ACLNN_SUCCESS),
